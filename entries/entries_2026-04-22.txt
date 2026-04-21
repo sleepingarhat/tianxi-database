@@ -1,4 +1,4 @@
-# meeting=2026-04-22 racecourse=HV written=2026-04-20
+# meeting=2026-04-22 racecourse=HV written=2026-04-21
 E175
 G125
 G126
