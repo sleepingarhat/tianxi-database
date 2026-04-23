@@ -1,0 +1,27 @@
+# Capy scraper-v2 runtime artefacts
+scrapers_v2/**/last_sync.json
+scrapers_v2/**/_horseid_map.json
+scrapers_v2/**/__pycache__/
+scrapers_v2/**/*.pyc
+
+# Failure logs
+failed_*.log
+*.failed.log
+
+# Local test outputs
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/

@@ -1,0 +1,80 @@
+name: Capy Pool A — Horse Profiles + Form
+
+# Full universe (~5,827 horses minus phantoms) takes ~3.5 hours at 0.5 req/s.
+# Skip-existing mode re-runs only horses without a form_<HORSE_NO>.csv yet.
+#
+# Runs weekly Sunday HK 04:00 (quiet window, lowest HKJC server load).
+
+on:
+  schedule:
+    # HK 04:00 Sunday = UTC 20:00 Saturday
+    - cron: '0 20 * * 6'
+  workflow_dispatch:
+    inputs:
+      horses:
+        description: 'Comma-separated brand codes (e.g. A001,K056). Blank = full universe.'
+        required: false
+        default: ''
+      limit:
+        description: 'Smoke-test limit (max N horses). Blank = no limit.'
+        required: false
+        default: ''
+      skip_existing:
+        description: 'Skip horses whose form CSV already exists'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  scrape-horses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: capy/scraper-v2
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: hkjc-data
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build CLI args
+        id: args
+        run: |
+          ARGS="--rate 0.5 --log-level INFO"
+          if [ -n "${{ github.event.inputs.horses }}" ]; then
+            ARGS="$ARGS --horses ${{ github.event.inputs.horses }}"
+          fi
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          # Default skip-existing ON for scheduled runs; honor dispatch input otherwise.
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.skip_existing }}" = "true" ]; then
+            ARGS="$ARGS --skip-existing"
+          fi
+          echo "cli=$ARGS" >> $GITHUB_OUTPUT
+
+      - name: Run Pool A scraper
+        working-directory: hkjc-data
+        run: |
+          python -m scrapers_v2.orchestrator.pool_a.scrape_horses ${{ steps.args.outputs.cli }}
+
+      - name: Commit horse updates
+        working-directory: hkjc-data
+        run: |
+          git config --global user.name  "Capy Scraper Bot"
+          git config --global user.email "capy-bot@noreply.github.com"
+          git add horses/
+          if git diff --cached --quiet; then
+            echo "No horse changes — skipping commit"
+          else
+            git commit -m "chore(capy): Pool A refresh $(date -u +%Y-%m-%d)"
+            git push origin capy/scraper-v2
+          fi
