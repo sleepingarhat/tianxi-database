@@ -1,0 +1,125 @@
+name: Capy Data Integrity Audit
+
+# 每日 Data Integrity Audit — 檢查 DB 每個 category 100% 齊全
+# 原則:「數據係命根，唔可以遺漏。」
+#
+# Exit codes (from tools/data_integrity_audit.py):
+#   0  全綠
+#   1  warn-only
+#   2  critical (有 missing profile / records / race artefact)
+
+on:
+  schedule:
+    - cron: '0 3 * * *'    # HK 11:00 每日（Pool A/B daily 已完成後）
+  workflow_dispatch:
+    inputs:
+      auto_open_issue:
+        description: 'Open GitHub Issue on critical (true/false)'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run integrity audit
+        id: audit
+        continue-on-error: true
+        run: |
+          python3 tools/data_integrity_audit.py --repo-root .
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Read audit summary
+        id: parse
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open('audit_reports/integrity_latest.json', encoding='utf-8') as f:
+              r = json.load(f)
+          print(f"severity={r['overall_severity']}")
+          print(f"critical={r['critical_gap_count']}")
+          print(f"warn={r['warn_gap_count']}")
+          print(f"recommend={r['recommendation']}")
+          PY
+
+      - name: Commit + push audit artefacts
+        run: |
+          git config user.email "bot@tianxi.ai"
+          git config user.name "天喜 Bot"
+          git add audit_reports/
+          if git diff --cached --quiet; then
+            echo "No audit changes to commit"
+          else
+            git commit -m "[audit][skip ci] ${{ steps.parse.outputs.severity }} critical=${{ steps.parse.outputs.critical }} warn=${{ steps.parse.outputs.warn }} · $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push origin main
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Data Integrity Audit · $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "- **Severity:** \`${{ steps.parse.outputs.severity }}\`"
+            echo "- **Critical gap count:** ${{ steps.parse.outputs.critical }}"
+            echo "- **Warn gap count:** ${{ steps.parse.outputs.warn }}"
+            echo "- **Recommendation:** \`${{ steps.parse.outputs.recommend }}\`"
+            echo ""
+            cat audit_reports/SUMMARY.md 2>/dev/null | head -40 || echo "_no SUMMARY.md_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Auto-open Issue if critical
+        if: >
+          steps.parse.outputs.severity == 'critical' &&
+          (github.event.inputs.auto_open_issue != 'false')
+        run: |
+          # dedupe: close existing open issues with same title prefix first
+          TITLE="[integrity] CRITICAL gaps detected ($(date -u +%Y-%m-%d))"
+          BODY_FILE="/tmp/issue_body.md"
+          {
+            echo "## Data Integrity Audit — CRITICAL"
+            echo ""
+            echo "- Severity: \`${{ steps.parse.outputs.severity }}\`"
+            echo "- Critical gaps: **${{ steps.parse.outputs.critical }}**"
+            echo "- Warn gaps: ${{ steps.parse.outputs.warn }}"
+            echo "- Recommendation: \`${{ steps.parse.outputs.recommend }}\`"
+            echo ""
+            echo "### Full SUMMARY.md"
+            echo ""
+            cat audit_reports/SUMMARY.md
+            echo ""
+            echo "---"
+            echo "Triggered by run ${{ github.run_id }}"
+          } > "$BODY_FILE"
+
+          # close stale integrity issues
+          for n in $(gh issue list --label integrity --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Superseded by new audit run."
+          done || true
+
+          gh issue create \
+            --title "$TITLE" \
+            --body-file "$BODY_FILE" \
+            --label integrity
+
+      - name: Fail job if critical (makes badge red)
+        if: steps.parse.outputs.severity == 'critical'
+        run: |
+          echo "::error::Data integrity audit found ${{ steps.parse.outputs.critical }} critical gaps"
+          exit 1
