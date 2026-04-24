@@ -5,9 +5,10 @@ name: Capy Pool A — Horse Profiles + Trackwork + Injury
 #   HorseTrackwork_Scraper.py  — morning trackwork history
 #   HorseInjury_Scraper.py     — injury/retirement status (requests-based)
 #
-# Option A cutover: cron ENABLED but gated by date guard (>= 2026-04-27).
-# Before cutover date, the pre-flight step exits 0 without running the scrapers,
-# preventing double-scrape with the Replit first-pass still in progress.
+# Cutover status: FULL CUTOVER as of 2026-04-24.
+# Replit VM confirmed stopped (last periodic-backup commit 2026-04-23 06:25 UTC,
+# silent >26h since). Date gate lifted — Pool A is now the sole owner of
+# horse profile / trackwork / injury scraping.
 #
 # The daily cron runs at HK 04:00 (UTC 20:00), ~4 hours after race_daily completes,
 # so the lifecycle classifier sees fresh last_race_date values.
@@ -44,22 +45,14 @@ jobs:
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pre-flight — cutover + fixture guards
+      - name: Pre-flight - fixture guard (cutover gate removed 2026-04-24)
         id: guard
         run: |
           FORCE="${{ github.event.inputs.force }}"
-          CUTOVER="2026-04-27"
-          TODAY=$(TZ=Asia/Hong_Kong date +%Y-%m-%d)
 
           if [ "$FORCE" = "true" ]; then
-            echo "force=true — bypassing guards"
+            echo "force=true - bypassing fixture guard"
             echo "run=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if [ "$TODAY" \< "$CUTOVER" ]; then
-            echo "Before cutover ($TODAY < $CUTOVER) — Pool A gated by Option A."
-            echo "run=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
