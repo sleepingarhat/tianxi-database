@@ -42,25 +42,44 @@ HEADERS = {
     "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8",
 }
 
-# Race-day cells look like:
-#   <td class="calendar">
-#       <p class="f_clear">
-#           <span class="f_fl f_fs14">DD</span>
-#           ...venue images...
-# The day number lives in the first <span class="f_fl ..."> inside a td.calendar.
-CALENDAR_RE = re.compile(
-    r'<td[^>]*class="calendar"[^>]*>\s*<p[^>]*>\s*<span[^>]*class="f_fl[^"]*"[^>]*>\s*(\d{1,2})\s*</span>',
+# Race-day cells look like (verified via browser DOM inspection 2026-04-24):
+#   <td class="calendar"> DD <img alt="ST|HV"> ... </td>
+# Non-race cells:
+#   <td class="font_wb ">DD</td>  (normal weekday)
+#   <td class="color_H font_wb">DD</td> (other-month filler)
+#
+# We match td.calendar specifically and grab the first 1-2 digit number appearing
+# within the cell (may or may not be wrapped in <span> or <p>). We then use the
+# presence of a venue marker (ST/HV/AWT/st-ch/hv-ch) as a sanity gate.
+CALENDAR_CELL_RE = re.compile(
+    r'<td[^>]*class="calendar"[^>]*>(.*?)</td>',
     re.IGNORECASE | re.DOTALL,
 )
+DAY_IN_CELL_RE = re.compile(r'>\s*(\d{1,2})\s*<|^\s*(\d{1,2})\b', re.DOTALL)
+VENUE_MARKER_RE = re.compile(r'(?:alt="(?:ST|HV|AWT)"|/(?:st-ch|hv-ch|awt)\.(?:gif|png))', re.IGNORECASE)
 
 
 def fetch_month(client: httpx.Client, year: int, month: int) -> List[int]:
-    """Return list of race-day day-of-month integers for the given (year, month)."""
-    url = f"{FIXTURE_URL}?calyear={year}&calmonth={month:02d}"
+    """Return list of race-day day-of-month integers for the given (year, month).
+
+    Note: HKJC accepts both lowercase (calyear/calmonth) and CamelCase
+    (CalYear/CalMonth). The page redirects to /zh-hk/local/information/fixture,
+    so follow_redirects=True is required.
+    """
+    url = f"{FIXTURE_URL}?CalYear={year}&CalMonth={month:02d}"
     r = client.get(url, timeout=20.0)
     r.raise_for_status()
-    days = [int(d) for d in CALENDAR_RE.findall(r.text)]
-    return sorted({d for d in days if 1 <= d <= 31})
+    days = []
+    for cell_html in CALENDAR_CELL_RE.findall(r.text):
+        # Require a venue marker to qualify as race day
+        if not VENUE_MARKER_RE.search(cell_html):
+            continue
+        m = DAY_IN_CELL_RE.search(cell_html)
+        if m:
+            d = int(m.group(1) or m.group(2))
+            if 1 <= d <= 31:
+                days.append(d)
+    return sorted(set(days))
 
 
 def scrape_year(year: int) -> List[Dict]:

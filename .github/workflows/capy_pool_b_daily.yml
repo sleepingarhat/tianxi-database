@@ -28,30 +28,40 @@ jobs:
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Pre-flight — fixture guard (any race day within ±2 days?)
+        id: guard
+        run: bash scripts/fixture_guard.sh --window 2 --direction any
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.run == 'true'
         with:
           python-version: '3.12'
 
       - name: Setup Chrome
         id: chrome
+        if: steps.guard.outputs.run == 'true'
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
       - name: Setup ChromeDriver
+        if: steps.guard.outputs.run == 'true'
         uses: nanasess/setup-chromedriver@v2
 
       - name: Export browser paths
+        if: steps.guard.outputs.run == 'true'
         run: |
           echo "CHROMIUM_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
           echo "CHROMEDRIVER_PATH=$(which chromedriver)" >> $GITHUB_ENV
 
       - name: Install Python deps
+        if: steps.guard.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Pool B scrapers
+        if: steps.guard.outputs.run == 'true'
         run: |
           SKIP="${{ github.event.inputs.skip_scrapers }}"
           for scraper in TrialResults_Scraper.py JockeyData_Scraper.py; do
@@ -68,6 +78,7 @@ jobs:
           done
 
       - name: Push Pool B data to main
+        if: steps.guard.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

@@ -5,22 +5,30 @@ name: Capy Pool A — Horse Profiles + Trackwork + Injury
 #   HorseTrackwork_Scraper.py  — morning trackwork history
 #   HorseInjury_Scraper.py     — injury/retirement status (requests-based)
 #
-# Option A cutover: cron DISABLED until first-pass completes (~4/27).
-# Until then, run via workflow_dispatch only.
+# Option A cutover: cron ENABLED but gated by date guard (>= 2026-04-27).
+# Before cutover date, the pre-flight step exits 0 without running the scrapers,
+# preventing double-scrape with the Replit first-pass still in progress.
+#
+# The daily cron runs at HK 04:00 (UTC 20:00), ~4 hours after race_daily completes,
+# so the lifecycle classifier sees fresh last_race_date values.
+#
+# Additional fixture-aware guard: skip Pool A unless yesterday was a race day
+# (Pool A depends on fresh last_race_date), saving GHA minutes on non-race-adjacent
+# days. Override via dispatch input `force=true`.
 
 on:
-  # Option A cutover — cron remains disabled until first-pass is complete
-  # (target: 2026-04-27). To enable, uncomment the two `cron` lines below.
-  # The daily cron runs at HK 04:00 (UTC 20:00), ~4 hours after race_daily
-  # completes, so the lifecycle classifier sees fresh last_race_date values.
-  # schedule:
-  #   - cron: '0 20 * * *'      # daily HK 04:00
+  schedule:
+    - cron: '0 20 * * *'      # daily HK 04:00
   workflow_dispatch:
     inputs:
       skip_scrapers:
         description: 'Comma-separated scrapers to skip (e.g. HorseTrackwork,HorseInjury)'
         required: false
         default: ''
+      force:
+        description: 'Bypass cutover + fixture guards (true/false)'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -36,30 +44,58 @@ jobs:
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Pre-flight — cutover + fixture guards
+        id: guard
+        run: |
+          FORCE="${{ github.event.inputs.force }}"
+          CUTOVER="2026-04-27"
+          TODAY=$(TZ=Asia/Hong_Kong date +%Y-%m-%d)
+
+          if [ "$FORCE" = "true" ]; then
+            echo "force=true — bypassing guards"
+            echo "run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$TODAY" \< "$CUTOVER" ]; then
+            echo "Before cutover ($TODAY < $CUTOVER) — Pool A gated by Option A."
+            echo "run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Fixture-aware: run only if yesterday was a race day
+          bash scripts/fixture_guard.sh --window 1 --direction past
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.run == 'true'
         with:
           python-version: '3.12'
 
       - name: Setup Chrome
         id: chrome
+        if: steps.guard.outputs.run == 'true'
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
       - name: Setup ChromeDriver
+        if: steps.guard.outputs.run == 'true'
         uses: nanasess/setup-chromedriver@v2
 
       - name: Export browser paths
+        if: steps.guard.outputs.run == 'true'
         run: |
           echo "CHROMIUM_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
           echo "CHROMEDRIVER_PATH=$(which chromedriver)" >> $GITHUB_ENV
 
       - name: Install Python deps
+        if: steps.guard.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Pool A scrapers
+        if: steps.guard.outputs.run == 'true'
         run: |
           SKIP="${{ github.event.inputs.skip_scrapers }}"
           for scraper in HorseData_Scraper.py HorseTrackwork_Scraper.py HorseInjury_Scraper.py; do
@@ -76,6 +112,7 @@ jobs:
           done
 
       - name: Push Pool A data to main
+        if: steps.guard.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

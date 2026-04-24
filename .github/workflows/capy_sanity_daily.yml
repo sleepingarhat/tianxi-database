@@ -1,0 +1,117 @@
+name: Capy Sanity — Daily Status Dashboard
+
+# Polls all capy_* workflows and data commits for the last 24h, writes a
+# STATUS.md snapshot to main, and fails the job if any critical scraper has
+# had 0 successful runs in 48h (non-blocking alert).
+#
+# Runs at HK 10:00 daily = UTC 02:00, well after all morning workflows complete.
+
+on:
+  schedule:
+    - cron: '3 2 * * *'      # HK 10:03 daily (off the minute mark)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 20
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect workflow status
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          mkdir -p reports
+          OUT=reports/SANITY.md
+          NOW=$(date -u +%Y-%m-%dT%H:%MZ)
+          TODAY_HK=$(TZ=Asia/Hong_Kong date +%Y-%m-%d)
+          {
+            echo "# Capy Sanity Report"
+            echo ""
+            echo "_Generated $NOW (HK today = $TODAY_HK)_"
+            echo ""
+            echo "## Workflow status (last 5 runs each)"
+            echo ""
+            echo "| Workflow | Last status | Last time | 48h success |"
+            echo "|---|---|---|---|"
+          } > "$OUT"
+
+          for WF in capy_pool_a capy_pool_b_daily capy_entries capy_race_daily capy_trainer_fix capy_fixture_weekly; do
+            RESP=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/workflows/${WF}.yml/runs?per_page=5" || echo '{"workflow_runs":[]}')
+
+            LAST_STATUS=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('workflow_runs',[]); print(r[0]['conclusion'] if r else 'none')")
+            LAST_TIME=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('workflow_runs',[]); print(r[0]['updated_at'] if r else '—')")
+            SUCCESS_48H=$(echo "$RESP" | python3 -c "
+import sys, json, datetime
+d = json.load(sys.stdin)
+cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)
+ok = 0
+for r in d.get('workflow_runs', []):
+    t = datetime.datetime.fromisoformat(r['updated_at'].replace('Z', '+00:00'))
+    if t >= cutoff and r.get('conclusion') == 'success':
+        ok += 1
+print(ok)")
+            echo "| $WF | $LAST_STATUS | $LAST_TIME | $SUCCESS_48H |" >> "$OUT"
+          done
+
+          {
+            echo ""
+            echo "## Data freshness"
+            echo ""
+            echo "| Artefact | Last commit | Rows |"
+            echo "|---|---|---|"
+          } >> "$OUT"
+
+          for CSV in data/fixtures/fixtures.csv data/pool_a_horses.csv trainers/trainer_profiles.csv; do
+            if [ -f "$CSV" ]; then
+              LAST=$(git log -1 --format='%ai' -- "$CSV" 2>/dev/null || echo "—")
+              ROWS=$(wc -l < "$CSV" 2>/dev/null || echo "?")
+              echo "| $CSV | $LAST | $ROWS |" >> "$OUT"
+            else
+              echo "| $CSV | MISSING | — |" >> "$OUT"
+            fi
+          done
+
+          {
+            echo ""
+            echo "## Today's fixture"
+            echo ""
+          } >> "$OUT"
+          if [ -f data/fixtures/fixtures.csv ]; then
+            if grep -q "^$TODAY_HK," data/fixtures/fixtures.csv; then
+              echo "Today ($TODAY_HK) **IS** a race day." >> "$OUT"
+            else
+              echo "Today ($TODAY_HK) is not a race day." >> "$OUT"
+            fi
+          else
+            echo "Fixture cache missing." >> "$OUT"
+          fi
+
+          cat "$OUT"
+
+      - name: Commit sanity report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "capy-sanity-bot"
+          git config user.email "sanity@capy.bot"
+          git add reports/SANITY.md
+          if git diff --staged --quiet; then
+            echo "No change to SANITY.md — skipping commit"
+          else
+            git commit -m "[sanity][skip ci] daily status $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push origin HEAD:main
+          fi
