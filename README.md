@@ -1,13 +1,16 @@
 # 天喜數據庫 · Tianxi Database
 
-> **香港賽馬 AI 數據平台** — 2016–2026 全量歷史賽果 + 每日自動更新 + Elo rating pipeline，開箱即用嘅 backend-as-CSV 數據層。
+> **香港賽馬 AI 數據平台** — 2016–2026 全量歷史賽果 + 每日自動爬取 + Elo rating pipeline + Data Integrity Audit。以 GitHub 為 backend，CSV 為介面，下游即開即用。
 
+[![Pool A](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_pool_a.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_pool_a.yml)
 [![Pool B](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_pool_b_daily.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_pool_b_daily.yml)
 [![Race Day](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_race_daily.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_race_daily.yml)
 [![Trainer](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_trainer_fix.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_trainer_fix.yml)
+[![Entries](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_entries.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_entries.yml)
 [![Fixture](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_fixture_weekly.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_fixture_weekly.yml)
 [![Elo v1.1](https://github.com/sleepingarhat/tianxi-database/actions/workflows/elo-v11.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/elo-v11.yml)
 [![Sanity](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_sanity_daily.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_sanity_daily.yml)
+[![Integrity](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_integrity_audit.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_integrity_audit.yml)
 
 ---
 
@@ -16,128 +19,332 @@
 | 指標 | 規模 |
 |---|---|
 | 歷史賽果年份 | **2016 – 2026**（11 年） |
-| 總賽果 row 數 | **~67,000 場次** |
-| 馬匹 Profile | **1,889 匹** |
-| Form 往績檔 | **1,899 份** |
-| 練馬師 Profile | **67 位** |
-| 騎師 Profile | **~100 位** |
-| 2025-2026 Fixture 日曆 | **152 場** 預先落 cache |
-| 每日自動更新 workflow | **7 條** |
-| 結構化數據總 size | **~88 MB** CSV (`utf-8-sig`) |
+| 賽馬日總數 | **886 race days** |
+| 賽事總數 | **8,361 races**（每日 × 每場 unique） |
+| 賽果 row 數 | **106,004 rows**（每匹馬每場 1 row） |
+| 每日每場 artefact | **5 種**（results / commentary / dividends / sectional_times / video_links） |
+| 馬匹 Profile 覆蓋 | 動態（backfill in progress） |
+| 練馬師 Profile | **67 位**（active roster） |
+| 騎師 Profile | **~100 位**（含 apprentice + freelance） |
+| Fixture 日曆 cache | **152 race days** (2025-2026) |
+| 每日自動 workflow | **9 條** |
+| 結構化數據總 size | ~90 MB CSV（`utf-8-sig`） |
 
-**所有數據** 直接由 GitHub raw endpoint 讀取 —— 前端可當 CDN，零 server 運維。
+**消費模式：** 前端/ML/BI 直接 fetch GitHub raw CSV。零 server、零 DB 運維。
 
 ---
 
 ## 點解存在？
 
-香港賽馬會（HKJC）官方只出 SPA + PDF，冇結構化 API。
-天喜數據庫把 11 年公開賽果「抽象化」成標準 CSV schema，每日自動刷新，為下游 AI 產品（評分模型、選馬助手、賠率分析）提供穩定數據層。
+香港賽馬會（HKJC）官方只出 SPA + PDF，冇公開 structured API。
+天喜把 HKJC 11 年公開賽果抽象化成穩定 CSV schema，每日自動刷新，為下游 AI 產品（Elo / 選馬模型 / 賠率分析 / BI）提供可信數據層。
 
-- ✅ **全自動** — GitHub Actions cron + 賽事日曆感知調度
-- ✅ **自愈** — 每日 sanity dashboard 監察 48h 成功率 + 數據新鮮度
-- ✅ **零 vendor lock** — 所有 artefact 係純 CSV，Python / R / SQL / Excel 即開即用
-- ✅ **Idempotent** — 已存在檔案會 skip，安全 re-run
+- **全自動** — GitHub Actions cron，9 條 workflow 協同跑
+- **賽日感知** — `fixture_guard` 非賽日自動跳過，每月慳 ~60% GHA minutes
+- **自愈** — 每日 sanity dashboard + integrity audit，遺漏自動開 Issue
+- **Idempotent** — 已存在檔案 skip，安全重跑
+- **零 vendor lock** — 純 CSV artefact，Python / R / SQL / Excel / JS 即用
 
 ---
 
 ## 架構一覽
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                  HKJC 官方網站 (SPA + SSR)                    │
-└──────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  GitHub Actions Orchestrator (天喜數據庫 · 7 個 workflow)      │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
-│  │  Pool A      │  │  Pool B      │  │  Race Day    │        │
-│  │  馬匹 DB      │  │  試閘/排位/   │  │  賽果        │        │
-│  │  (日 delta)  │  │  騎師/練馬師  │  │  (race day)  │        │
-│  └──────────────┘  └──────────────┘  └──────────────┘        │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
-│  │  Trainer     │  │  Fixture     │  │  Elo v1.1    │        │
-│  │  Refresh     │  │  Weekly      │  │  Rating      │        │
-│  │  (SPA fix)   │  │  (年曆 cache) │  │  (post-proc) │        │
-│  └──────────────┘  └──────────────┘  └──────────────┘        │
-│                                                              │
-│                  Fixture Guard (pre-flight)                  │
-│          checks data/fixtures/ 前先決定跑唔跑                │
-│                                                              │
-│            Daily Sanity Dashboard → reports/SANITY.md        │
-└──────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│          Git main branch (CSV artefacts, utf-8-sig)          │
-│                                                              │
-│   data/20{16..26}/   horses/profiles/   trainers/            │
-│   data/fixtures/     horses/form_records/   jockeys/         │
-│   entries/           horses/trackwork/      trials/          │
-└──────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│      下游產品 (前端 / ML / Backtest / BI dashboard)           │
-│      直接 fetch `raw.githubusercontent.com/...csv`           │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                  HKJC 官方網站 (SPA + SSR)                   │
+│  racing.hkjc.com · 賽果 / 排位 / 試閘 / 晨操 / 傷患 / 日曆    │
+└─────────────────────────────────────────────────────────────┘
+                         │ Selenium + httpx
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│          GitHub Actions Orchestrator (9 workflow)           │
+│                                                             │
+│ ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐     │
+│ │ Race Day  │ │  Pool A   │ │  Pool B   │ │  Entries  │     │
+│ │ 賽果      │ │ 馬匹 DB    │ │ 試閘+騎師  │ │ 排位表     │     │
+│ └───────────┘ └───────────┘ └───────────┘ └───────────┘     │
+│                                                             │
+│ ┌───────────┐ ┌───────────┐ ┌───────────┐                   │
+│ │  Trainer  │ │ Fixture   │ │  Elo v1.1 │                   │
+│ │ 練馬師     │ │ 日曆       │ │ Rating    │                   │
+│ └───────────┘ └───────────┘ └───────────┘                   │
+│                                                             │
+│ ┌───────────────────────┐ ┌───────────────────────┐         │
+│ │ Sanity (daily 10:03)  │ │ Integrity (daily 11:00)│        │
+│ │ 48h 健康報告           │ │ 10-category 缺漏審計     │       │
+│ └───────────────────────┘ └───────────────────────┘         │
+│                                                             │
+│              fixture_guard.sh (pre-flight)                  │
+│         查 data/fixtures/ 決定跑唔跑當日 workflow            │
+└─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│     Git main branch — CSV artefacts (utf-8-sig, pinned)     │
+│                                                             │
+│  data/20{16..26}/    horses/profiles/    trainers/          │
+│  data/fixtures/      horses/form_records/ jockeys/          │
+│  entries/            horses/trackwork/    trials/           │
+│  reports/            horses/injury/       audit_reports/    │
+└─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│     下游產品 (前端 / ML / Backtest / BI)                      │
+│     直接 fetch `raw.githubusercontent.com/...csv`           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 運作邏輯
+## 爬取器清單（What & How）
 
-### 1. 調度策略（Calendar-Aware Scheduling）
+每個 scraper 都係獨立 Python module，Selenium（JS-rendered 頁）或 httpx（靜態頁），全部經 `scraper_utils.py` 共用 rate-limit + retry + driver pool。HKJC empirical rate limit ≥0.4 req/s，最多 2 並發 Chrome session。
 
-每條 workflow 開工前先行 `scripts/fixture_guard.sh --window N --direction past|future|any`，
-讀 `data/fixtures/YYYY_fixtures.csv` 確認「今日或相關窗口有冇賽日」。
+### 1. `RacingData_Scraper.py` — 賽果主爬蟲
 
-| Workflow | Cron (HK) | Fixture Guard | 目的 |
+**爬乜：** 每個賽馬日、每場賽事，擷取 **5 個 artefact**：
+- `results_YYYY-MM-DD.csv`：25-column 固定 schema（名次、馬名、馬號、騎師、練馬師、距離、場地、賠率、完成時間、位位差、配備…）
+- `commentary_YYYY-MM-DD.csv`：逐匹馬嘅 running commentary
+- `dividends_YYYY-MM-DD.csv`：獨贏、位置、連贏、位置Q、三重彩、六環彩等賠率
+- `sectional_times_YYYY-MM-DD.csv`：每 200m 分段時間
+- `video_links_YYYY-MM-DD.csv`：官方 replay URL（MP4 direct link）
+
+**點運作：**
+- Selenium Chrome headless，load `racing.hkjc.com/racing/information/Chinese/Racing/LocalResults.aspx`
+- Iterate `race_no=1..N`，wait for `table.f_tac` render
+- Parse `<td>` cells → pandas DataFrame → CSV
+- **`--daily` mode**：只爬今日，先問 `fixture_guard.sh` 有冇賽，冇就 exit 0
+- **`--date YYYY-MM-DD` mode**：爬特定日子
+- **`--backfill` mode**：多 worker 並行爬歷史年份（初次 bootstrap 用）
+
+**Trigger：** `capy_race_daily.yml` — HK 23:30 每日 cron（賽日夜場完結後），GHA job step 1 先 fixture_guard。
+
+---
+
+### 2. `HorseData_Scraper.py` — 馬匹 Profile + 往績（Pool A 核心）
+
+**爬乜：**
+- `horses/profiles/horse_profiles.csv`：每匹馬 profile（品種、產地、年齡、父系、母系、母父、染色、毛色、進口日期、練馬師、馬主、當前評分、出生地、cohort code、first-race date、last-race date…）
+- `horses/form_records/form_XXXX.csv`：每匹馬完整出賽紀錄（21 column，直到最新一場）
+
+**點運作：**
+- 先掃 `data/*/results_*.csv` 抽出所有獨特馬匹 `(XNNN)` code（X = A-L cohort letter）
+- 對每匹馬 load `racing.hkjc.com/racing/information/Chinese/Horse/Horse.aspx?HorseId=XXXX`
+- Parse profile table + full form-record table
+- `comeback_detection.py` 決定要唔要 rescrape（已退役 + 冇 update 就 skip）
+- `lifecycle_helper.py` 識別 active / inactive / retired
+
+**Trigger：** `capy_pool_a.yml` — HK 04:00 每日 cron。Fixture-aware：**昨日非賽日就 skip**（fresh last_race_date 未 update，冇嘢好 diff）。`force=true` dispatch 可 override。
+
+---
+
+### 3. `HorseTrackwork_Scraper.py` — 晨操紀錄
+
+**爬乜：** `horses/trackwork/trackwork_XXXX.csv` — 每次訓練 session（日期、時段、練習類型：G/T/C/Sw/Slip、跑道、距離、時間、rider）。
+
+**點運作：**
+- 從 horse profile 頁面 navigate 去「晨操紀錄」tab
+- Parse full trackwork table（好多馬有幾百 row）
+- Incremental：每次只 append 新 session
+
+**Trigger：** Pool A 內序貫跑（在 HorseData 之後）。
+
+---
+
+### 4. `HorseInjury_Scraper.py` — 獸醫 / 傷患紀錄
+
+**爬乜：** `horses/injury/injury_<brand_no>.csv` — 每個獸醫事件（日期、詳情、通過日期）。
+
+**點運作：**
+- 需要 `horseid` (HK_YYYY_BRAND 格式，非 XNNN)，所以先 cache `_horseid_map.json`
+- 第一次：掃 horse profile 解 horseid；之後：直接 map lookup
+- Load `racing.hkjc.com/zh-hk/local/information/ovehorse?horseid=HK_YYYY_BRAND`
+- **pure httpx + regex**（非 Selenium），因為係靜態 table
+- 有紀錄先寫 CSV，冇記錄就唔寫（省空間）
+
+**Trigger：** Pool A 內序貫跑（最後 step）。
+
+---
+
+### 5. `TrainerData_Scraper.py` — 練馬師 Profile + 往績
+
+**爬乜：**
+- `trainers/trainer_profiles.csv` — 67 位練馬師 profile（勝率、名次率、獎金、當季 stats）
+- `trainers/records/trainer_CODE.csv` — 每位練馬師全部場次紀錄
+
+**點運作：**
+- Load trainer ranking page → 抽所有 `name → code` mapping
+- 對每個 code scrape profile stats + 歷屆紀錄
+- **Dedup-clean**：HKJC SPA 偶發雙 render，用 `keep=last` 保留最新
+
+**Trigger：** `capy_trainer_fix.yml` — HK 01:00 每日 cron（fixture-aware：過去 2 日有賽先跑）。
+
+---
+
+### 6. `JockeyData_Scraper.py` — 騎師 Profile + 往績
+
+**爬乜：**
+- `jockeys/jockey_profiles.csv` — ~100 位騎師（含 apprentice + freelance）
+- `jockeys/records/jockey_CODE.csv` — 每位騎師歷屆紀錄（13-col record：排名、場地、距離、級別、場地狀況、馬名、檔位、評分、練馬師、配備、體重、實際磅重）
+
+**點運作：** 同 trainer 邏輯一致，但 URL 係 `jockeypastrec.aspx`。
+
+**Trigger：** `capy_pool_b_daily.yml` — HK 02:00 每日，跟 TrialResults 一齊跑（~20 min wall-clock）。
+
+---
+
+### 7. `TrialResults_Scraper.py` — 試閘結果
+
+**爬乜：**
+- `trials/trial_results.csv` — 18-col 試閘結果（日期、組別、場地、距離、場地狀況、組別時間、每匹馬分段、馬名、騎師、練馬師、檔位、配備、位位差、running position、完成時間、result、commentary）
+- `trials/trial_sessions.csv` — group-level summary
+
+**點運作：**
+- Load `racing.hkjc.com/zh-hk/local/information/btresult`
+- Parse every trial session group → 每匹馬展開 1 row
+- Skip 已存在 session（idempotent）
+
+**Trigger：** Pool B Daily 內跑（先 TrialResults 後 JockeyData）。
+
+---
+
+### 8. `EntryList_Scraper.py` — 排位表（race card）
+
+**爬乜：**
+- `entries/today_entries.txt` — 下場賽馬日嘅所有 horse code（header：`# meeting=YYYY-MM-DD`）
+- `entries/entries_<YYYY-MM-DD>.txt` — dated archive（只喺完全成功先寫）
+
+**點運作：**
+- SPA readiness：同時 wait「horse link render」或「沒有相關資料」sentinel 先 judge race empty
+- Per-race retry on timeout（防 transient render fail）
+- End-of-meeting only declared on confirmed sentinel **after page fully loaded**（唔可以靠 timeout 斷定）
+- **Fail-closed**：任何錯誤寫 empty stale-marker，downstream loader 會識 skip override
+
+**下游用途：** Pool A 讀 `today_entries.txt` 觸發 **comeback override** — 冷門退役馬如果再 entry，即使 `should_scrape()` judge 係 dormant，都強制 rescrape profile。
+
+**Trigger：** `capy_entries.yml` — HK 20:00 逢星期一、二、六 cron（即下場賽馬日前一晚）。
+
+---
+
+### 9. `FixtureCalendar_Scraper.py` — 賽馬日年曆
+
+**爬乜：** `data/fixtures/fixtures.csv`（152 rows，2025-2026）+ `data/fixtures/<year>_fixtures.csv`
+
+Columns: `date, season_year, month, day, weekday, captured_at`
+
+**點運作：**
+- **httpx + regex（零 Selenium）**，因為 HKJC 年曆係 server-rendered
+- Loop every month：`Fixture.aspx?calyear=Y&calmonth=M`
+- Extract `<td class="calendar">DD</td>` cells（有賽）
+- Skip `<td class="font_wb ">DD</td>` (non-race weekday) 同 `<td class="color_H font_wb">DD</td>` (other-month filler)
+- **Venue-marker sanity gate**：交叉驗證 HKJC LocalResults API 回傳 `norace` 就剔除（防 phantom dates）
+
+**Trigger：** `capy_fixture_weekly.yml` — 每星期一 HK 05:00 cron（HKJC 通常週日發佈下季賽期）。
+
+**點解咁重要：** `fixture_guard.sh` 用呢個 cache，所有 workflow pre-flight check 先避免非賽日 wake 到 HKJC。
+
+---
+
+### 10. `RunAll_Scrapers.py` — Legacy orchestrator
+
+Backfill / developer tooling，**不參與 daily cron**。跑佢會序貫執行所有 scraper 一次（~6 hour wall-clock），主要用喺 initial bootstrap 同 manual repair。
+
+---
+
+## 調度策略 (Calendar-Aware Scheduling)
+
+每條 workflow 開工前必跑 `scripts/fixture_guard.sh --window N --direction past|future|any`。
+
+| Workflow | Cron (HKT) | Fixture Guard | 目的 |
 |---|---|---|---|
-| Pool B Daily | 02:00 | 冇 | 試閘/排位/騎師/練馬師 delta |
-| Pool A Daily | 04:00 | ≥4/27 cutover + 昨日有賽 | 馬匹 DB delta |
-| Race Day | 賽日晚 19:30 / 23:30 | 今日有賽 | 抓當日賽果 |
-| Entries | 賽日早 09:00 | 明日有賽 | 排位表 |
-| Trainer | 01:00 | 過去 2 日有賽 | 練馬師 SPA refresh |
-| Fixture Weekly | 週日 HK 13:15 | 冇 | 更新年曆 cache（24 個月） |
-| Sanity Daily | 10:03 | 冇 | 生成 reports/SANITY.md |
+| Race Day | 23:30 每日 | 今日有賽 | 抓當日 5 artefact |
+| Pool A | 04:00 每日 | 昨日有賽（force 可 override） | 馬匹 DB delta |
+| Pool B Daily | 02:00 每日 | 冇（輕量，日日跑唔傷） | 試閘 + 騎師 |
+| Trainer | 01:00 每日 | 過去 2 日有賽 | 練馬師 SPA refresh |
+| Entries | 20:00 逢一、二、六 | 明日有賽 | 下場排位表 |
+| Fixture Weekly | 週一 05:00 | 冇 | 年曆 cache refresh |
+| Elo v1.1 | 04:00 每日 | 冇 | 評分 batch |
+| Sanity Daily | 10:03 | 冇 | 生成 SANITY.md |
+| Integrity Audit | 11:00 | 冇 | 10-cat 缺漏審計 |
 
-**結果:** 非賽日自動跳過，每月節省 ~60% GHA minutes，同時防 HKJC rate limit。
+---
 
-### 2. 數據層 (Data Artefacts)
+## 數據層 (Data Artefacts)
 
 ```
 data/
-├── fixtures/                    # 年曆 + 賽日 cache
-│   ├── fixtures.csv             # 152 rows (2025-2026)
+├── fixtures/                       # 年曆 cache
+│   ├── fixtures.csv                # 152 rows (2025-2026)
 │   └── 2026_fixtures.csv
-├── 2016/ … 2026/                # 每年賽果
-│   ├── results_YYYY-MM-DD.csv   # 25-col 固定 schema
-│   └── commentary_YYYY-MM-DD.csv
+├── 2016/ … 2026/                   # 每年賽果 — 5 類 artefact per race day
+│   ├── results_YYYY-MM-DD.csv          # 25-col 賽果
+│   ├── commentary_YYYY-MM-DD.csv       # running commentary
+│   ├── dividends_YYYY-MM-DD.csv        # 賠率
+│   ├── sectional_times_YYYY-MM-DD.csv  # 分段時間
+│   └── video_links_YYYY-MM-DD.csv      # replay URL
 horses/
-├── profiles/horse_profiles.csv  # 1,889 匹馬（動態列，label match）
-├── form_records/form_XXXX.csv   # 1,899 份（21-col schema）
-├── trackwork/                   # 晨操
-└── injury/                      # 傷患
+├── profiles/horse_profiles.csv     # 馬匹 profile（動態列）
+├── form_records/form_XXXX.csv      # 每匹馬完整出賽紀錄（21-col）
+├── trackwork/trackwork_XXXX.csv    # 晨操
+└── injury/injury_<brand>.csv       # 獸醫紀錄
 trainers/
-├── trainer_profiles.csv         # 67 位（dedup-clean，keep=last）
-└── records/                     # 往績
+├── trainer_profiles.csv            # 67 位
+└── records/trainer_CODE.csv        # 往績
 jockeys/
-├── jockey_profiles.csv
-└── records/jockey_*.csv         # 19-col + 延伸
-trials/trial_results.csv         # 18-col 試閘
-entries/                         # 當日排位表
-reports/SANITY.md                # 每日健康報告
+├── jockey_profiles.csv             # ~100 位
+└── records/jockey_CODE.csv         # 13-col 往績
+trials/
+├── trial_results.csv               # 18-col 試閘
+└── trial_sessions.csv              # group summary
+entries/
+├── today_entries.txt               # 下場 race card
+└── entries_<DATE>.txt              # dated archive
+audit_reports/
+├── integrity_YYYY-MM-DD.json       # 每日 audit JSON
+├── integrity_latest.json           # 最新 snapshot
+└── SUMMARY.md                      # human-readable summary
+reports/
+└── SANITY.md                       # 每日健康報告
 ```
 
 所有 CSV：**UTF-8-BOM** (Excel-friendly) · **Schema 穩定** · **Column order pinned**。
 
-### 3. 評分層 (Elo v1.1)
+---
 
-`.elo-pipeline/` Node.js sub-project，每次 race result commit 後觸發，計算每匹馬 Elo rating 增減，結果 commit 返 repo。
+## 評分層 (Elo v1.1)
+
+`.elo-pipeline/` Node.js sub-project。每日 HK 04:00（race_daily 完成後）跑，5 個 axis：
+- `overall` · `turf_sprint` · `turf_mile` · `turf_middle` · `turf_staying`
+
+Output 存喺 GHA artifact `elo-v11-bulk-db-#`（SQLite，14-day retention），**唔 commit 入 repo**（53MB gzipped 12MB）。下游可以透過 GHA API 取 artifact。
+
+Snapshot 規模：73,646 horse Elo / 38,893 jockey / 37,287 trainer snapshot。
+
+---
+
+## 數據完整性 (Integrity Audit)
+
+核心原則：**數據係命根，唔可以遺漏。**
+
+`tools/data_integrity_audit.py` 每日 HK 11:00 跑，掃 10 個 category：
+
+1. race_artefacts（每個 race day 5 個 artefact 齊）
+2. fixtures_cache（年曆新鮮度）
+3. horse_profiles（現役馬 180 日內落場必須有 profile）
+4. horse_form_records（對應 form record 齊）
+5. jockey_profiles
+6. jockey_records
+7. trainer_profiles
+8. trainer_records
+9. trial_results
+10. entries_upcoming
+
+Exit codes: `0`=ok · `1`=warn · `2`=critical
+
+**Critical** 會自動開 GitHub Issue（有 dedupe）+ 紅 badge。
+
+[![Integrity](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_integrity_audit.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_integrity_audit.yml)
 
 ---
 
@@ -150,14 +357,17 @@ import pandas as pd
 
 BASE = "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main"
 
-# 讀 2025 年某場賽果
+# 讀某一場賽果
 df = pd.read_csv(f"{BASE}/data/2025/results_2025-09-07.csv", encoding="utf-8-sig")
 
-# 讀全部 1,889 匹馬 profile
+# 讀馬匹 profile
 horses = pd.read_csv(f"{BASE}/horses/profiles/horse_profiles.csv", encoding="utf-8-sig")
 
 # 讀練馬師
 trainers = pd.read_csv(f"{BASE}/trainers/trainer_profiles.csv", encoding="utf-8-sig")
+
+# 讀年曆
+fixtures = pd.read_csv(f"{BASE}/data/fixtures/fixtures.csv", encoding="utf-8-sig")
 ```
 
 ### JavaScript / Frontend
@@ -181,23 +391,22 @@ const text = await res.text();
 
 ## 健康監察
 
-- **每日 10:03 HK** sanity workflow 自動生成 `reports/SANITY.md`：
-  - 7 條 workflow 近 5 run 狀態 + 48h 成功次數
-  - 關鍵 artefact 最後 commit + row count
-  - 今日 fixture（race day / non-race day）
-- 查閱最新狀態：[reports/SANITY.md](./reports/SANITY.md)
+- **每日 HK 10:03** — `capy_sanity_daily.yml` 生成 `reports/SANITY.md`（9 條 workflow 48h 成功率 + artefact freshness + 今日 fixture）
+- **每日 HK 11:00** — `capy_integrity_audit.yml` 生成 `audit_reports/SUMMARY.md`（10-cat gap count + recommendation）
+- 查閱最新：[reports/SANITY.md](./reports/SANITY.md) · [audit_reports/SUMMARY.md](./audit_reports/SUMMARY.md)
 
 ---
 
 ## Roadmap
 
-- [x] Replit scraper → GitHub Actions 遷移（P0 pivot）
-- [x] Calendar-aware scheduling（fixture guard）
-- [x] Sanity dashboard (daily poll)
+- [x] 全量 GHA 部署（9 workflow）
+- [x] Calendar-aware scheduling（fixture_guard）
+- [x] Sanity dashboard
+- [x] Data Integrity Audit + auto-Issue
 - [x] Elo v1.1 batch
-- [ ] **Pool A 自動化 cutover @ 2026-04-27** (Replit first-pass 完成後)
-- [ ] Baseline tag `capy-handover-baseline-v1` @ 2026-04-26 12:00 UTC
-- [ ] Replit Reserved VM 停機（cutover 成功後）
+- [x] Pool A 全量接管
+- [ ] 1,268 現役馬 profile backfill（Pool A 批量 dispatch 進行中）
+- [ ] FixtureCalendar norace pre-filter（防 phantom date）
 - [ ] Elo v2（多因子 + 場地修正）
 - [ ] Public read-only API wrapper（Cloudflare Worker）
 
@@ -205,7 +414,7 @@ const text = await res.text();
 
 ## 許可 & 使用條款
 
-HKJC 原始賽果為公開資訊，本 repo 只做 **結構化重組** 與 **schema 穩定化**，不包括 HKJC 圖片、影片、或任何付費 pool 數據。下游使用請尊重 HKJC 原站 rate contract（≥0.4 req/s）。本 repo 內部爬取已限流 ~0.5-2.5 req/s，一個月未觸發封鎖。
+HKJC 原始賽果為公開資訊，本 repo 只做 **結構化重組** 同 **schema 穩定化**，不包括 HKJC 圖片、影片內容、或任何付費 pool 數據。下游使用請尊重 HKJC 原站 rate contract（≥0.4 req/s）。本 repo 內部爬取限流 ~0.5-2.5 req/s，符合 empirical 安全區。
 
 ---
 
@@ -213,8 +422,8 @@ HKJC 原始賽果為公開資訊，本 repo 只做 **結構化重組** 與 **sch
 
 - GHA 狀態：<https://github.com/sleepingarhat/tianxi-database/actions>
 - 每日 sanity：[reports/SANITY.md](./reports/SANITY.md)
-- Cutover 進度：[plan.md](./plan.md)
-- P0 pivot decision log：[CAPY_P0_PIVOT.md](./CAPY_P0_PIVOT.md)
-- Handover cutoff reference：[HANDOVER.md](./HANDOVER.md)
+- Integrity audit：[audit_reports/SUMMARY.md](./audit_reports/SUMMARY.md)
+- 系統規劃：[plan.md](./plan.md)
+- Data schema 詳情：[DATA_NOTES.md](./DATA_NOTES.md)
 
-*Maintained by Capy / GitHub Actions · 原 Replit-side VM 預計 2026-04-27 停機。*
+*Maintained by Capy / GitHub Actions · 9 個 workflow 24/7 自主運行 · 每日自動數據完整性審計。*
