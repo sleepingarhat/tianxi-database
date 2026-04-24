@@ -1,0 +1,78 @@
+name: capy-manifest-build
+
+# Auto-regenerate data/index.json whenever repo data changes.
+# Runs on: push to main touching data stores, daily cron, or manual dispatch.
+# The manifest is the SSOT for frontends to discover what data exists.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "data/**"
+      - "horses/**"
+      - "jockeys/**"
+      - "trainers/**"
+      - "trials/**"
+      - "entries/**"
+      - "audit_reports/integrity_latest.json"
+      - "tools/build_manifest.py"
+      - ".github/workflows/capy_manifest.yml"
+  schedule:
+    - cron: "15 4 * * *"  # daily HK 12:15 (after sanity + audit)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: capy-manifest
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build manifest
+        run: python3 tools/build_manifest.py
+
+      - name: Diff check
+        id: diff
+        run: |
+          if git diff --quiet -- data/index.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "[manifest] no changes"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "[manifest] changes detected"
+            git --no-pager diff --stat -- data/index.json
+          fi
+
+      - name: Commit & push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "capy-bot"
+          git config user.email "capy-bot@users.noreply.github.com"
+          git add data/index.json
+          git commit -m "[manifest][skip ci] regenerate data/index.json"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            echo "push retry $i"
+            sleep 5
+          done
+          exit 1
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ github.run_id }}
+          path: data/index.json
+          retention-days: 30
