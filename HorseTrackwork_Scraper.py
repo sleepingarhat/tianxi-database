@@ -13,6 +13,8 @@ Output:
 """
 
 import os, re, time
+import argparse
+import zlib
 import logging
 import pandas as pd
 from selenium.webdriver.common.by import By
@@ -22,6 +24,15 @@ from comeback_detection import should_scrape
 from lifecycle_helper import compute_last_race_dates, load_horse_state, load_today_entries
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+# ── CLI: shard control for parallel GHA matrix runs ─────────────────────────
+# Mirrors HorseData_Scraper.py. CRC32(horse_no) % total_shards == shard.
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--shard", type=int, default=0,
+                 help="Shard index (0..total_shards-1) for matrix runs.")
+_ap.add_argument("--total-shards", type=int, default=1,
+                 help="Total shard count. 1 = no sharding (full pass).")
+_ARGS = _ap.parse_args()
 PROFILES_FILE = os.path.join("horses", "profiles", "horse_profiles.csv")
 
 RESULTS_DIR   = "data"
@@ -56,6 +67,15 @@ for year in sorted(os.listdir(RESULTS_DIR)):
             pass
 
 print(f"Found {len(horse_nos)} unique horses.")
+
+# ── Shard filter (GHA matrix) — partition by CRC32(horse_no) ────────────────
+# Applied BEFORE the "already done" subtraction so each shard's done/todo
+# computation is scoped to its partition.
+if _ARGS.total_shards > 1:
+    before = len(horse_nos)
+    horse_nos = {h for h in horse_nos
+                 if zlib.crc32(h.encode()) % _ARGS.total_shards == _ARGS.shard}
+    print(f"Shard {_ARGS.shard}/{_ARGS.total_shards}: filtered {before} → {len(horse_nos)} horses")
 
 done = {f.replace("trackwork_", "").replace(".csv", "") for f in os.listdir(TRACKWORK_DIR) if f.endswith(".csv")}
 todo_raw = sorted(horse_nos - done)
