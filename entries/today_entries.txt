@@ -1,4 +1,4 @@
-# meeting=2026-04-26 racecourse=ST written=2026-04-23
+# meeting=2026-04-26 racecourse=ST written=2026-04-25
 E436
 E486
 G016
