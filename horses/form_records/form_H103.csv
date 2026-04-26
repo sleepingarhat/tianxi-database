@@ -1,0 +1,5 @@
+﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+H103,505,13,19/03/2023,沙田,草地,A,1400,好,4,3,47,黎昭昇,嘉里,12,214,122,8 7 9 13,1.24.10,1173,CP-/XB/V1/TT
+H103,430,14,19/02/2023,沙田,草地,A,1600,好,4,2,50,黎昭昇,鍾易禮,10-1/4,193,115,6 6 10 14,1.37.39,1181,XB/CP1/TT
+H103,376,13,29/01/2023,沙田,草地,A+3,1400,好,4,7,52,黎昭昇,巴度,10-1/4,73,127,13 14 14 13,1.24.02,1183,XB/TT
+H103,271,08,24/12/2022,沙田,草地,B,1400,好/快,4R,2,52,黎昭昇,馬雅,5-3/4,69,126,8 8 9 8,1.23.24,1197,XB1/TT1

@@ -1,0 +1,5 @@
+﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+L007,628,WV,22/04/26,跑馬地,草地,B,1200,好/快,4,--,53,伍鵬志,潘明輝,--,--,128,--,--,--,--
+L007,558,03,29/03/26,沙田,草地,A+3,1000,好/快,4,9,53,伍鵬志,潘明輝,1-1/4,6.9,128,4 3 3,0.56.28,1091,PC1
+L007,179,04,15/11/25,沙田,草地,A+3,1200,好,4R,12,53,伍鵬志,潘頓,3-3/4,1.6,125,2 2 4,1.09.96,1088,--
+L007,124,02,26/10/25,沙田,草地,A,1200,好/快,4R,8,52,伍鵬志,潘頓,1-3/4,12,127,2 4 2,1.09.14,1087,--

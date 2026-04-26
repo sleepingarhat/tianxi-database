@@ -1,0 +1,5 @@
+﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+L169,572,WV-A,01/04/26,沙田全天候,,,1200,好,3,--,62,徐雨石,巫顯東,--,--,113,--,--,--,--
+L169,520,12,15/03/26,沙田,草地,C+3,1000,好/快,3,10,64,徐雨石,巫顯東,3,123,116,4 4 12,0.56.18,1153,B2
+L169,442,13,14/02/26,沙田,草地,C+3,1000,好/快,3,4,66,徐雨石,巫顯東,6-3/4,185,121,8 11 13,0.56.56,1160,--
+L169,383,14,25/01/26,沙田,草地,A+3,1200,好/快,3,6,66,徐雨石,巫顯東,13-3/4,104,121,6 10 14,1.10.81,1147,B-/TT-

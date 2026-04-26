@@ -1,0 +1,5 @@
+﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+K329,357,WV,18/01/26,沙田,草地,A,1400,好,4,--,48,大衛希斯,霍宏聲,--,--,123,--,--,--,--
+K329,308,05,01/01/26,沙田,草地,B+2,1400,好,4,7,50,大衛希斯,霍宏聲,2-1/2,15,125,9 8 8 5,1.22.51,1195,CP-/B1
+K329,220,08,30/11/25,沙田,草地,C,1200,好,4,7,52,大衛希斯,楊明綸,5-1/4,41,127,11 10 8,1.09.67,1202,CP
+K329,155,07,05/11/25,跑馬地,草地,C+3,1200,好/快,4,8,52,大衛希斯,楊明綸,3,22,127,11 11 7,1.10.56,1211,CP1

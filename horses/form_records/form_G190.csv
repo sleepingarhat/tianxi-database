@@ -1,0 +1,5 @@
+﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+G190,514,04,20/03/2022,沙田,草地,A,2000,好,3,3,68,韋達,希威森,1,32,122,3 3 3 3 4,2.02.95,1084,B
+G190,364,12,23/01/2022,沙田,草地,A,2000,好,3,14,70,韋達,希威森,11,73,124,5 6 5 8 12,2.03.36,1064,B
+G190,317,10,05/01/2022,跑馬地,草地,A,1800,好,3,4,72,韋達,班德禮,4-1/2,41,125,6 7 8 9 10,1.49.96,1064,B
+G190,245,10,12/12/2021,沙田,草地,A,1800,好,3,7,72,韋達,希威森,4-1/4,121,125,3 2 2 1 10,1.48.12,1067,B1
