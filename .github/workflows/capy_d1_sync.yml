@@ -117,9 +117,9 @@ jobs:
           npx tsx scripts/push-delta.ts \
             --db=bulk-local.db \
             --since="$SINCE" \
+            --include=race \
             --out=/tmp/d1-delta
-          # D1 rejects BEGIN/COMMIT inline — strip them
-          sed -i '/^BEGIN;$/d; /^COMMIT;$/d' /tmp/d1-delta/*.sql
+          # push-delta.ts no longer wraps in BEGIN/COMMIT (D1-incompatible).
           ls -la /tmp/d1-delta/ | head -30
 
       - name: Install wrangler
