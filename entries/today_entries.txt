@@ -1,4 +1,4 @@
-# meeting=2026-05-20 racecourse=HV written=2026-05-18
+# meeting=2026-05-20 racecourse=HV written=2026-05-19
 D482
 E175
 E434
@@ -91,7 +91,6 @@ K479
 K503
 K515
 K533
-K543
 K549
 K567
 K575
