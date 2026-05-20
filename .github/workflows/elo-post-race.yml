@@ -122,13 +122,15 @@ jobs:
             console.log('jockey snapshots  :', jAll);
             console.log('trainer snapshots :', tAll);
             console.log('horse snaps since :', hSince);
-            if (hAll.n === 0) {
-              console.error('::error::No horse ELO snapshots in bulk-local.db at all - compute step is broken.');
-              process.exit(1);
-            }
-            if (form.max_d && hAll.max_d && hAll.max_d < form.max_d) {
-              console.error('::error::Snapshot integrity gap: snapshots reach ' + hAll.max_d + ' but form_records reach ' + form.max_d + '. compute_v12.ts is dropping recent races.');
-              process.exit(1);
+            for (const [axis, snap] of [['horse', hAll], ['jockey', jAll], ['trainer', tAll]]) {
+              if (snap.n === 0) {
+                console.error('::error::No ' + axis + ' ELO snapshots in bulk-local.db at all - compute step is broken.');
+                process.exit(1);
+              }
+              if (form.max_d && snap.max_d && snap.max_d < form.max_d) {
+                console.error('::error::' + axis + ' snapshot integrity gap: snapshots reach ' + snap.max_d + ' but form_records reach ' + form.max_d + '. compute_v12.ts is dropping recent races.');
+                process.exit(1);
+              }
             }
             if (hSince.n === 0) {
               console.log('::warning::No horse ELO snapshots updated since ' + since + ' - horse_form ingest is lagging behind results CSV. ELO is consistent with available form data; new results will be reflected after next profile re-scrape.');
