@@ -102,43 +102,40 @@ jobs:
           fi
 
       - name: Verify ELO snapshots in bulk-local.db
-          working-directory: tianxi-database/.elo-pipeline
-          env:
-            ELO_SINCE: ${{ steps.resolve.outputs.since }}
-          run: |
-            node -e "
-              const Database = require('better-sqlite3');
-              const db = new Database('./bulk-local.db', { readonly: true });
-              const since = process.env.ELO_SINCE;
-              const form = db.prepare('SELECT COUNT(*) AS n, MIN(race_date) AS min_d, MAX(race_date) AS max_d FROM horse_form_records').get();
-              const formRecent = db.prepare('SELECT COUNT(*) AS n, MAX(race_date) AS max_d FROM horse_form_records WHERE race_date >= ?').get(since);
-              const hAll = db.prepare('SELECT COUNT(*) AS n, MAX(as_of_date) AS max_d FROM horse_elo_snapshots').get();
-              const jAll = db.prepare('SELECT COUNT(*) AS n, MAX(as_of_date) AS max_d FROM jockey_elo_snapshots').get();
-              const tAll = db.prepare('SELECT COUNT(*) AS n, MAX(as_of_date) AS max_d FROM trainer_elo_snapshots').get();
-              const hSince = db.prepare('SELECT COUNT(*) AS n FROM horse_elo_snapshots WHERE as_of_date >= ?').get(since);
-              console.log('form (source)     :', form);
-              console.log('form since ' + since + ' :', formRecent);
-              console.log('horse snapshots   :', hAll);
-              console.log('jockey snapshots  :', jAll);
-              console.log('trainer snapshots :', tAll);
-              console.log('horse snaps since :', hSince);
-              // Hard fail: compute is broken
-              if (hAll.n === 0) {
-                console.error('::error::No horse ELO snapshots in bulk-local.db at all - compute step is broken.');
-                process.exit(1);
-              }
-              // Hard fail: compute silently dropped recent races
-              if (form.max_d && hAll.max_d && hAll.max_d < form.max_d) {
-                console.error('::error::Snapshot integrity gap: snapshots reach ' + hAll.max_d + ' but form_records reach ' + form.max_d + '. compute_v12.ts is dropping recent races.');
-                process.exit(1);
-              }
-              // Soft warn: ingest lag (horse_profile re-scrape trails results CSV)
-              if (hSince.n === 0) {
-                console.log('::warning::No horse ELO snapshots updated since ' + since + ' - horse_form ingest is lagging behind results CSV. ELO is consistent with available form data; new results will be reflected after next profile re-scrape.');
-              }
-            "
+        working-directory: tianxi-database/.elo-pipeline
+        env:
+          ELO_SINCE: ${{ steps.resolve.outputs.since }}
+        run: |
+          node -e "
+            const Database = require('better-sqlite3');
+            const db = new Database('./bulk-local.db', { readonly: true });
+            const since = process.env.ELO_SINCE;
+            const form = db.prepare('SELECT COUNT(*) AS n, MIN(race_date) AS min_d, MAX(race_date) AS max_d FROM horse_form_records').get();
+            const formRecent = db.prepare('SELECT COUNT(*) AS n, MAX(race_date) AS max_d FROM horse_form_records WHERE race_date >= ?').get(since);
+            const hAll = db.prepare('SELECT COUNT(*) AS n, MAX(as_of_date) AS max_d FROM horse_elo_snapshots').get();
+            const jAll = db.prepare('SELECT COUNT(*) AS n, MAX(as_of_date) AS max_d FROM jockey_elo_snapshots').get();
+            const tAll = db.prepare('SELECT COUNT(*) AS n, MAX(as_of_date) AS max_d FROM trainer_elo_snapshots').get();
+            const hSince = db.prepare('SELECT COUNT(*) AS n FROM horse_elo_snapshots WHERE as_of_date >= ?').get(since);
+            console.log('form (source)     :', form);
+            console.log('form since ' + since + ' :', formRecent);
+            console.log('horse snapshots   :', hAll);
+            console.log('jockey snapshots  :', jAll);
+            console.log('trainer snapshots :', tAll);
+            console.log('horse snaps since :', hSince);
+            if (hAll.n === 0) {
+              console.error('::error::No horse ELO snapshots in bulk-local.db at all - compute step is broken.');
+              process.exit(1);
+            }
+            if (form.max_d && hAll.max_d && hAll.max_d < form.max_d) {
+              console.error('::error::Snapshot integrity gap: snapshots reach ' + hAll.max_d + ' but form_records reach ' + form.max_d + '. compute_v12.ts is dropping recent races.');
+              process.exit(1);
+            }
+            if (hSince.n === 0) {
+              console.log('::warning::No horse ELO snapshots updated since ' + since + ' - horse_form ingest is lagging behind results CSV. ELO is consistent with available form data; new results will be reflected after next profile re-scrape.');
+            }
+          "
 
-        - name: Generate ELO delta SQL chunks
+      - name: Generate ELO delta SQL chunks
         working-directory: tianxi-backend
         env:
           SINCE: ${{ steps.resolve.outputs.since }}
