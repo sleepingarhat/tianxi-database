@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-05-20T07:55:52+00:00",
+  "generated_at": "2026-05-21T08:04:15+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "a4f8f43047727e5cd342b8efdbb98f4cee2d86e9",
+  "git_head": "553dede74dc7e5aab88fb350a8056c1a6bff2fe5",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -175,10 +175,10 @@
   "integrity": {
     "latest_report": "audit_reports/integrity_latest.json",
     "raw_url": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/audit_reports/integrity_latest.json",
-    "scan_date": "2026-05-20",
+    "scan_date": "2026-05-21",
     "overall_severity": "warn",
     "critical_gap_count": 0,
-    "warn_gap_count": 21,
+    "warn_gap_count": 7,
     "recommendation": "monitor_no_block"
   },
   "policy": {
