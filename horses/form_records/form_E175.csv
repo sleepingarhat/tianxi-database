@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+E175,709,06,20/05/26,跑馬地,草地,A,1000,好,4,11,52,韋達,布浩榮,2-3/4,29,127,10 8 6,0.57.45,1100,B/TT
 E175,630,03,22/04/26,跑馬地,草地,B,1000,好/快,4,11,52,韋達,布浩榮,1-1/4,40,127,3 3 3,0.56.95,1094,B/TT
 E175,528,07,18/03/26,跑馬地,草地,A,1000,好/快,4,11,54,韋達,布文,2-3/4,23,130,6 6 7,0.57.01,1108,B/TT
 E175,429,03,11/02/26,跑馬地,草地,A,1000,好/快,4,12,54,韋達,麥文堅,1-1/2,29,131,7 6 3,0.57.10,1114,B/TT

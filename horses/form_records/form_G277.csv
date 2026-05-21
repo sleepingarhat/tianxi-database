@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+G277,706,07,20/05/26,跑馬地,草地,A,1650,好,4,12,42,黎昭昇,巴度,8-3/4,62,117,12 12 11 7,1.40.61,1061,B-
 G277,690,12,13/05/26,跑馬地,草地,C+3,1650,好/快,4,6,44,黎昭昇,希威森,9-1/4,46,121,10 10 11 12,1.41.62,1061,B
 G277,627,09,22/04/26,跑馬地,草地,B,1650,好/快,4,2,46,黎昭昇,希威森,5-1/2,17,122,8 8 8 9,1.41.32,1057,B2
 G277,607,09,15/04/26,跑馬地,草地,A,1650,好,4,4,48,黎昭昇,奧爾民,7,28,123,6 6 7 9,1.40.38,1060,--
