@@ -1,4 +1,4 @@
-# Data Integrity Audit · 2026-05-21
+# Data Integrity Audit · 2026-05-22
 
 **Overall:** 🟡 `warn`  ·  critical gaps: **0**  ·  warn gaps: 7
 
@@ -16,5 +16,5 @@
 | jockey_records | 🟡 warn | 64 | 59 | 5 | 0 | 5 jockey profiles have no records file |
 | trainer_profiles | 🟢 ok | 44 | 44 | 0 | 0 | total trainer profiles: 67 |
 | trainer_records | 🟢 ok | 67 | 67 | 0 | 0 |  |
-| trial_results | 🟢 ok | 1 | 1 | 0 | 0 | trial rows: 6178 |
+| trial_results | 🟢 ok | 1 | 1 | 0 | 0 | trial rows: 6197 |
 | entries_upcoming | 🟡 warn | 2 | 0 | 2 | 0 | 2 upcoming race days lack entries file |
