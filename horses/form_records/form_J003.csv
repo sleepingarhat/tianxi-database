@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+J003,714,02,24/05/26,沙田,草地,A,1600,好,5,11,21,丁冠豪,楊明綸,短馬頭位,18,116,5 6 4 2,1.35.05,1144,CP
 J003,606,04,15/04/26,跑馬地,草地,A,1650,好,5,11,23,丁冠豪,楊明綸,2,7.4,120,4 4 4 4,1.40.69,1140,CP
 J003,526,04,18/03/26,跑馬地,草地,A,1650,好/快,5,10,23,丁冠豪,楊明綸,1/2,31,119,6 6 4 4,1.39.14,1152,CP
 J003,386,08,28/01/26,跑馬地,草地,C,1650,好/快,5,9,25,丁冠豪,楊明綸,2-1/2,17,120,2 2 2 8,1.40.13,1145,CP
