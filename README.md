@@ -23,8 +23,9 @@
 | [**tianxi-site**](https://github.com/sleepingarhat/tianxi-site) (public) | CF Pages 靜態前端 · HKJC 3-level layout | Vanilla HTML/CSS/JS |
 
 Production URLs：
-- Backend API: `https://tianxi-backend.tianxi-entertainment.workers.dev`
-- Frontend: `https://tianxi-site.pages.dev`
+- Public API（canonical）: `https://tianxi.racing/api/*`（CF Worker apex domain，mTLS proxy 後）
+- Frontend（canonical）: `https://tianxi.racing`（apex；underlying host `tianxi-site.pages.dev`）
+- Backend Worker direct: `https://tianxi-backend.tianxi-entertainment.workers.dev`（debug / cron 用，平時 user 唔行）
 
 ---
 
@@ -41,7 +42,7 @@ Production URLs：
 | 練馬師 Profile | **67 位**（active roster） |
 | 騎師 Profile | **~100 位**（含 apprentice + freelance） |
 | Fixture 日曆 cache | **152 race days** (2025-2026) |
-| 每日自動 workflow | **9 條** |
+| 每日自動 workflow | **10 條**（+ ELO Post-Race） |
 | 結構化數據總 size | ~90 MB CSV（`utf-8-sig`） |
 
 **消費模式：** 前端/ML/BI 直接 fetch GitHub raw CSV。零 server、零 DB 運維。
@@ -53,7 +54,7 @@ Production URLs：
 香港賽馬會（HKJC）官方只出 SPA + PDF，冇公開 structured API。
 天喜把 HKJC 11 年公開賽果抽象化成穩定 CSV schema，每日自動刷新，為下游 AI 產品（Elo / 選馬模型 / 賠率分析 / BI）提供可信數據層。
 
-- **全自動** — GitHub Actions cron，9 條 workflow 協同跑
+- **全自動** — GitHub Actions cron，10 條 workflow 協同跑
 - **賽日感知** — `fixture_guard` 非賽日自動跳過，每月慳 ~60% GHA minutes
 - **自愈** — 每日 sanity dashboard + integrity audit，遺漏自動開 Issue
 - **Idempotent** — 已存在檔案 skip，安全重跑
@@ -71,7 +72,7 @@ Production URLs：
                          │ Selenium + httpx
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│          GitHub Actions Orchestrator (9 workflow)           │
+│          GitHub Actions Orchestrator (10 workflow)          │
 │                                                             │
 │ ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐     │
 │ │ Race Day  │ │  Pool A   │ │  Pool B   │ │  Entries  │     │
@@ -422,7 +423,7 @@ const text = await res.text();
 
 ## 健康監察
 
-- **每日 HK 10:03** — `capy_sanity_daily.yml` 生成 `reports/SANITY.md`（9 條 workflow 48h 成功率 + artefact freshness + 今日 fixture）
+- **每日 HK 10:03** — `capy_sanity_daily.yml` 生成 `reports/SANITY.md`（10 條 workflow 48h 成功率 + artefact freshness + 今日 fixture）
 - **每日 HK 11:00** — `capy_integrity_audit.yml` 生成 `audit_reports/SUMMARY.md`（10-cat gap count + recommendation）
 - 查閱最新：[reports/SANITY.md](./reports/SANITY.md) · [audit_reports/SUMMARY.md](./audit_reports/SUMMARY.md)
 
@@ -443,7 +444,7 @@ const text = await res.text();
 - [x] **TX-Oracle v3 ensemble**（取代原 "Elo v2"）— LightGBM lambdarank + ELO v12 probability-level blend，α=0.62 val-tuned
   - `lgb_backfill.yml` 單日補算 workflow
   - `alpha_tune.yml` ADMIN_TOKEN-gated α 掃描 + per-(date,alpha) server cache
-- [x] **Public read-only API** — `https://tianxi.racing/api/*`（CF Worker apex domain），開放 `/meetings`、`/top-picks`、`/hit-rate`、`/today-picks`
+- [x] **Public read-only API** — `https://tianxi.racing/api/*`（CF Worker apex domain），開放 `/api/meetings`、`/api/analyze/top-picks`、`/api/analyze/hit-rate`、`/api/analyze/today-picks`
 - [x] 全棧 cleanup（2026-05-22 → 05-25）
   - Batch 2：v11 ELO strip、site `assets/shell.js` nav dedup
   - Batch 3：horse/results 頁 API-driven 重寫
@@ -459,7 +460,7 @@ const text = await res.text();
 
 **長期**
 - [ ] 場地修正 model（going × distance × draw 交互項加入 LGB feature）
-- [ ] Backtest harness 自動回歸測試（替代 manual `/hit-rate` 抽查）
+- [ ] Backtest harness 自動回歸測試（替代 manual `/api/analyze/hit-rate` 抽查）
 - [ ] OpenAPI spec for `tianxi.racing` 公開 API
 
 ---
