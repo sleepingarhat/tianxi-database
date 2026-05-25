@@ -180,3 +180,25 @@ jobs:
           wrangler d1 execute tianxi-db --remote \
             --command="SELECT COUNT(*) AS meetings, MAX(date) AS latest FROM race_meetings" \
             --json | tail -40
+
+      - name: Cleanup duplicate / phantom meeting rows
+        if: steps.csv.outputs.skip != 'true'
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::warning::ADMIN_TOKEN secret not set — skipping cleanup-duplicate-meetings"
+            exit 0
+          fi
+          echo "Probing for phantom meetings (dry-run)..."
+          DRY=$(curl -sS -X POST -H "Authorization: Bearer $ADMIN_TOKEN"             "https://tianxi.racing/admin/api/cleanup-duplicate-meetings?dry=1")
+          echo "$DRY"
+          WOULD=$(echo "$DRY" | python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d.get('wouldDelete',[])))" 2>/dev/null || echo 0)
+          if [ "$WOULD" = "0" ]; then
+            echo "No phantom meetings found — nothing to clean."
+            exit 0
+          fi
+          echo "Found $WOULD phantom meeting(s) — executing cleanup..."
+          curl -sS -X POST -H "Authorization: Bearer $ADMIN_TOKEN"             "https://tianxi.racing/admin/api/cleanup-duplicate-meetings"
+          echo
