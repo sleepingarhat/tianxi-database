@@ -1,6 +1,0 @@
-node_modules/
-bulk.db
-bulk.db-*
-bulk.db.gz
-*.log
-.DS_Store
