@@ -2,6 +2,8 @@ name: ELO Post-Race Auto-Update
 
 # Fires automatically after Capy Race Day commits new results CSVs.
 # 1. Ingest HKJC CSVs (profiles + form) into scratch bulk-local.db
+#    (using tianxi-backend/scripts/ingest — the .elo-pipeline duplicate
+#    was removed in Cleanup Batch 4; canonical scripts live in backend repo)
 # 2. Run ELO v12 compute → horse/jockey/trainer_elo_snapshots
 # 3. Generate delta SQL chunks via push-delta.ts (include=elo)
 # 4. Push chunks to Cloudflare D1 via wrangler d1 execute
@@ -9,8 +11,6 @@ name: ELO Post-Race Auto-Update
 # Also supports manual dispatch for backfill.
 
 on:
-  # Cron fallback — ELO depends on race_daily (15:30 UTC) + d1_sync (16:23 UTC).
-  # Run after d1_sync finishes so ELO sees fresh race results.
   schedule:
     - cron: '13 17 * * *'   # 01:13 HK (after d1_sync 00:23 HK)
   workflow_run:
@@ -47,7 +47,7 @@ jobs:
           path: tianxi-database
           fetch-depth: 1
 
-      - name: Checkout tianxi-backend (push-delta.ts)
+      - name: Checkout tianxi-backend (scripts + push-delta.ts)
         uses: actions/checkout@v4
         with:
           repository: sleepingarhat/tianxi-backend
@@ -75,34 +75,30 @@ jobs:
             echo "mode=incremental" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install ELO pipeline deps
-        working-directory: tianxi-database/.elo-pipeline
-        run: npm ci --no-audit --no-fund
-
-      - name: Install tianxi-backend deps
+      - name: Install tianxi-backend deps (provides scripts + tsx + better-sqlite3)
         working-directory: tianxi-backend
         run: npm ci --no-audit --no-fund
 
       - name: Ingest CSVs into bulk-local.db
-        working-directory: tianxi-database/.elo-pipeline
+        working-directory: tianxi-backend
         run: |
-          npx tsx scripts/ingest/index.ts profiles form --data-dir=..
+          npx tsx scripts/ingest/index.ts profiles form --data-dir=../tianxi-database --db=./bulk-local.db
           ls -la bulk-local.db
 
       - name: Run ELO v12 compute
-        working-directory: tianxi-database/.elo-pipeline
+        working-directory: tianxi-backend
         env:
           ELO_SINCE: ${{ steps.resolve.outputs.since }}
           ELO_MODE: ${{ steps.resolve.outputs.mode }}
         run: |
           if [ "$ELO_MODE" = "full" ]; then
-            npx tsx scripts/elo/compute.ts --engine v12 --full
+            npx tsx scripts/elo/compute.ts --engine v12 --full --db=./bulk-local.db
           else
-            npx tsx scripts/elo/compute.ts --engine v12 --since "$ELO_SINCE"
+            npx tsx scripts/elo/compute.ts --engine v12 --since "$ELO_SINCE" --db=./bulk-local.db
           fi
 
       - name: Verify ELO snapshots in bulk-local.db
-        working-directory: tianxi-database/.elo-pipeline
+        working-directory: tianxi-backend
         env:
           ELO_SINCE: ${{ steps.resolve.outputs.since }}
         run: |
@@ -122,10 +118,6 @@ jobs:
             console.log('jockey snapshots  :', jAll);
             console.log('trainer snapshots :', tAll);
             console.log('horse snaps since :', hSince);
-            // Horse axis is treated as the canonical integrity signal (FAIL).
-            // Jockey & trainer historically refresh on a different cadence in compute_v12;
-            // log gaps as WARN here so silent regressions still surface in the run summary
-            // without false-failing on the known cadence offset. Tracked as #ELO-2026-002.
             if (hAll.n === 0) {
               console.error('::error::No horse ELO snapshots in bulk-local.db at all - compute step is broken.');
               process.exit(1);
@@ -142,7 +134,7 @@ jobs:
               }
             }
             if (hSince.n === 0) {
-              console.log('::warning::No horse ELO snapshots updated since ' + since + ' - horse_form ingest is lagging behind results CSV. ELO is consistent with available form data; new results will be reflected after next profile re-scrape.');
+              console.log('::warning::No horse ELO snapshots updated since ' + since + ' - horse_form ingest is lagging behind results CSV.');
             }
           "
 
@@ -154,7 +146,7 @@ jobs:
           set -eu
           rm -rf /tmp/d1-delta
           npx tsx scripts/push-delta.ts \
-            --db=../tianxi-database/.elo-pipeline/bulk-local.db \
+            --db=./bulk-local.db \
             --since="$SINCE" \
             --include=elo \
             --out=/tmp/d1-delta
@@ -170,7 +162,6 @@ jobs:
         working-directory: tianxi-backend
         run: |
           set -eu
-          # FK-parent-first order for ELO snapshots
           ORDER=(horses jockeys trainers horse_elo_snapshots jockey_elo_snapshots trainer_elo_snapshots)
           FAILED=0
           for t in "${ORDER[@]}"; do
