@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-05-25T10:44:12+00:00",
+  "generated_at": "2026-05-26T08:00:35+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "9e17ac4fe294c93a3edf9e54a0e6403f03e3033f",
+  "git_head": "c88dc84cfb76ce4307a2846642a0af4fcddba3c8",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -18,7 +18,7 @@
     "race_days": 911,
     "race_artefact_files": 4549,
     "fixtures_rows": 143,
-    "horse_form_files": 5986,
+    "horse_form_files": 5987,
     "horse_profile_rows": 5989,
     "jockey_record_files": 59,
     "jockey_profile_rows": 66,
@@ -95,7 +95,7 @@
       "form_records": {
         "dir": "horses/form_records/",
         "path_template": "horses/form_records/form_{horse_id}.csv",
-        "count": 5986,
+        "count": 5987,
         "sample": [
           "form_A001.csv",
           "form_A002.csv",
@@ -145,8 +145,8 @@
       "format": "txt",
       "path_template": "entries/entries_{date}.txt",
       "today_pointer": "entries/today_entries.txt",
-      "count": 0,
-      "latest": null,
+      "count": 1,
+      "latest": "entries_2026-05-27.txt",
       "note": "TXT (not CSV); space-delimited; race_number=0 means meeting-level batch"
     },
     "news": {
@@ -175,11 +175,11 @@
   "integrity": {
     "latest_report": "audit_reports/integrity_latest.json",
     "raw_url": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/audit_reports/integrity_latest.json",
-    "scan_date": "2026-05-25",
-    "overall_severity": "critical",
-    "critical_gap_count": 1,
-    "warn_gap_count": 7,
-    "recommendation": "gha_next_delta_will_fix"
+    "scan_date": "2026-05-26",
+    "overall_severity": "warn",
+    "critical_gap_count": 0,
+    "warn_gap_count": 6,
+    "recommendation": "monitor_no_block"
   },
   "policy": {
     "odds_weighting": "disabled (beta=0 hardcoded in win-probability model)",
