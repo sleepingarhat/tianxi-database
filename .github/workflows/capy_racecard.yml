@@ -4,7 +4,10 @@ name: Capy Racecard — enrich entries_upcoming via hkjc-api
 # via hkjc-api.getAllRaces() and upserts into entries_upcoming in D1,
 # replacing sentinel race_number=0 rows with real per-race data.
 #
-# Run AFTER capy_entries (horse stubs seeded), BEFORE today-picks prediction.
+# Run AFTER capy_d1_sync_entries (D1 entries refreshed), BEFORE today-picks prediction.
+# Triggered automatically by capy_d1_sync_entries completion to prevent races
+# where a raw entries-sync wipes the enrichment. Schedule retained as belt-and-braces.
+#
 # Schedule: race-day mornings HKT (Mon/Wed/Fri/Sat 09:00 HKT = 01:00 UTC).
 
 on:
@@ -26,8 +29,12 @@ on:
         description: 'D1 delete+push since YYYY-MM-DD (blank = today HKT)'
         required: false
         default: ''
+  workflow_run:
+    workflows: ['Capy D1 Sync Entries — forward-looking racecards']
+    types: [completed]
+    branches: [main]
   schedule:
-    # Mon/Wed/Fri/Sat 09:00 HKT = 01:00 UTC
+    # Mon/Wed/Fri/Sat 09:00 HKT = 01:00 UTC — safety net if upstream chain skipped
     - cron: '0 1 * * 1,3,5,6'
 
 permissions:
@@ -39,6 +46,10 @@ concurrency:
 
 jobs:
   enrich-racecard:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
