@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-05-26T08:00:35+00:00",
+  "generated_at": "2026-05-27T08:12:17+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "c88dc84cfb76ce4307a2846642a0af4fcddba3c8",
+  "git_head": "9e15d228195637d18fec47e880e829dfc92d354b",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -15,8 +15,8 @@
     "readme": "README.md"
   },
   "summary": {
-    "race_days": 911,
-    "race_artefact_files": 4549,
+    "race_days": 912,
+    "race_artefact_files": 4554,
     "fixtures_rows": 143,
     "horse_form_files": 5987,
     "horse_profile_rows": 5989,
@@ -49,16 +49,16 @@
       "path_template": "data/{year}/{kind}_{date}.csv",
       "raw_url_template": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/data/{year}/{kind}_{date}.csv",
       "count_by_kind": {
-        "results": 905,
-        "commentary": 911,
-        "dividends": 911,
-        "sectional": 911,
-        "video": 911
+        "results": 906,
+        "commentary": 912,
+        "dividends": 912,
+        "sectional": 912,
+        "video": 912
       },
-      "distinct_race_days": 911,
+      "distinct_race_days": 912,
       "date_range": {
         "start": "2016-01-01",
-        "end": "2026-05-24"
+        "end": "2026-05-27"
       },
       "season_years": [
         2016,
@@ -74,7 +74,7 @@
         2026
       ],
       "example": {
-        "results": "data/2026/results_2026-05-24.csv"
+        "results": "data/2026/results_2026-05-27.csv"
       }
     },
     "fixtures": {
@@ -133,11 +133,11 @@
     "trials": {
       "results": {
         "path": "trials/trial_results.csv",
-        "row_count": 6229
+        "row_count": 6324
       },
       "sessions": {
         "path": "trials/trial_sessions.csv",
-        "row_count": 805
+        "row_count": 815
       },
       "note": "HKJC retains ~176 days only; pre-2025-03-13 irrecoverable"
     },
@@ -175,10 +175,10 @@
   "integrity": {
     "latest_report": "audit_reports/integrity_latest.json",
     "raw_url": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/audit_reports/integrity_latest.json",
-    "scan_date": "2026-05-26",
+    "scan_date": "2026-05-27",
     "overall_severity": "warn",
     "critical_gap_count": 0,
-    "warn_gap_count": 6,
+    "warn_gap_count": 21,
     "recommendation": "monitor_no_block"
   },
   "policy": {
