@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+K186,733,05,27/05/26,跑馬地,草地,B,1200,好/快,3,8,66,廖康銘,希威森,3/4,21,121,11 11 5,1.10.19,1019,CP
 K186,609,09,15/04/26,跑馬地,草地,A,1650,好,3,4,68,廖康銘,奧爾民,4-1/2,24,124,8 8 8 9,1.40.26,1023,CP
 K186,552,07,25/03/26,跑馬地,草地,B,1650,好,3,1,70,廖康銘,希威森,5,12,127,6 6 7 7,1.41.16,1028,CP
 K186,505,11,08/03/26,沙田,草地,C,1400,好,3,7,71,廖康銘,希威森,5-1/4,47,127,12 12 10 11,1.22.70,1025,CP
