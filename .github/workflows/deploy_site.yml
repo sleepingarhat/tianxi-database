@@ -11,16 +11,25 @@ on:
         description: CF Pages project name
         required: false
         default: tianxi-site
+  # Auto-deploy after each race day's results land (same trigger the D1
+  # sync + ELO post-race use), so the live site always reflects the latest
+  # committed source. Results display itself is already API-dynamic.
+  workflow_run:
+    workflows: ['Capy Race Day — RacingData Results']
+    types: [completed]
+    branches: [main]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # On workflow_run, only deploy if the upstream results workflow succeeded.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout tianxi-site
         uses: actions/checkout@v4
         with:
           repository: sleepingarhat/tianxi-site
-          ref: ${{ github.event.inputs.ref }}
+          ref: ${{ github.event.inputs.ref || 'main' }}
           path: site
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -33,4 +42,4 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         working-directory: site
-        run: wrangler pages deploy . --project-name="${{ github.event.inputs.project }}" --branch=main --commit-dirty=true
+        run: wrangler pages deploy . --project-name="${{ github.event.inputs.project || 'tianxi-site' }}" --branch=main --commit-dirty=true
