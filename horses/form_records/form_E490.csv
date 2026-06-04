@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+E490,747,06,03/06/26,跑馬地,草地,C,1200,好/快,4,11,54,桂福特,周俊樂,3-1/4,29,127,10 11 6,1.09.80,1083,CP
 E490,691,08,13/05/26,跑馬地,草地,C+3,1200,好/快,4,9,56,桂福特,霍宏聲,5,44,131,2 4 8,1.10.61,1085,B-/CP1
 E490,610,07,15/04/26,跑馬地,草地,A,1200,好,4,1,58,桂福特,奧爾民,4-1/2,9.9,133,3 4 7,1.10.47,1092,B
 E490,547,06,25/03/26,跑馬地,草地,B,1200,好,4,1,59,桂福特,霍宏聲,2-1/2,3.9,134,6 5 6,1.10.09,1082,B
