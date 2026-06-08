@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+H409,755,11,07/06/26,沙田,草地,C,1400,好,5,8,36,賀賢,黃寶妮,5-3/4,26,123,7 8 7 11,1.23.27,1074,CP
 H409,676,08,09/05/26,沙田,草地,C,1400,好/黏,5,4,38,賀賢,黃寶妮,3,7,125,2 5 4 8,1.23.68,1082,CP
 H409,496,12,08/03/26,沙田,草地,C,1400,好,5,9,40,賀賢,艾道拿,3-1/2,5.5,135,7 7 7 12,1.23.07,1076,CP1
 H409,476,05,01/03/26,沙田,草地,B+2,1400,好,4,8,41,賀賢,艾兆禮,1/2,18,117,6 6 6 5,1.22.06,1088,V-
