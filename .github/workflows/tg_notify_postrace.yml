@@ -1,0 +1,37 @@
+name: TG Notify — Post-race (recap)
+
+# Posts the post-race hit-rate recap to the public Telegram channel after each
+# race day's results land (same workflow_run signal D1 sync / ELO / site deploy
+# use). Reads only the public API; skips silently if no settled meeting.
+
+on:
+  workflow_run:
+    workflows: ['Capy Race Day — RacingData Results']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'YYYY-MM-DD override (blank = latest settled)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Post post-race recap
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python3 tools/tg_notify.py postrace ${{ inputs.date && format('--date {0}', inputs.date) || '' }}
