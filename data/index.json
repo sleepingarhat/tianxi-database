@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-06-08T09:03:18+00:00",
+  "generated_at": "2026-06-09T08:01:43+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "c47c0bf67947a104051da221ed33d2d59410039c",
+  "git_head": "3c0db2eb247e3226bde8e6e0966c24da6b5e1d9c",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -18,7 +18,7 @@
     "race_days": 915,
     "race_artefact_files": 4569,
     "fixtures_rows": 143,
-    "horse_form_files": 6012,
+    "horse_form_files": 6013,
     "horse_profile_rows": 6015,
     "jockey_record_files": 59,
     "jockey_profile_rows": 66,
@@ -95,7 +95,7 @@
       "form_records": {
         "dir": "horses/form_records/",
         "path_template": "horses/form_records/form_{horse_id}.csv",
-        "count": 6012,
+        "count": 6013,
         "sample": [
           "form_A001.csv",
           "form_A002.csv",
@@ -133,11 +133,11 @@
     "trials": {
       "results": {
         "path": "trials/trial_results.csv",
-        "row_count": 6496
+        "row_count": 6550
       },
       "sessions": {
         "path": "trials/trial_sessions.csv",
-        "row_count": 836
+        "row_count": 844
       },
       "note": "HKJC retains ~176 days only; pre-2025-03-13 irrecoverable"
     },
@@ -145,8 +145,8 @@
       "format": "txt",
       "path_template": "entries/entries_{date}.txt",
       "today_pointer": "entries/today_entries.txt",
-      "count": 4,
-      "latest": "entries_2026-06-07.txt",
+      "count": 5,
+      "latest": "entries_2026-06-10.txt",
       "note": "TXT (not CSV); space-delimited; race_number=0 means meeting-level batch"
     },
     "news": {
@@ -175,11 +175,11 @@
   "integrity": {
     "latest_report": "audit_reports/integrity_latest.json",
     "raw_url": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/audit_reports/integrity_latest.json",
-    "scan_date": "2026-06-08",
-    "overall_severity": "critical",
-    "critical_gap_count": 1,
-    "warn_gap_count": 7,
-    "recommendation": "gha_next_delta_will_fix"
+    "scan_date": "2026-06-09",
+    "overall_severity": "warn",
+    "critical_gap_count": 0,
+    "warn_gap_count": 6,
+    "recommendation": "monitor_no_block"
   },
   "policy": {
     "odds_weighting": "disabled (beta=0 hardcoded in win-probability model)",
