@@ -1,0 +1,37 @@
+name: TG Notify — Pre-race (free pick)
+
+# Posts the race-day preview + 1 free featured pick to the public Telegram
+# channel on the morning of a HK race day. Reads only the public API; the
+# script skips silently when the upcoming meeting is not today.
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 09:00 HKT — after LGB predict (04:00 HKT) settles
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Post even if the upcoming meeting is not today'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Post pre-race preview
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python3 tools/tg_notify.py prerace ${{ inputs.force == 'true' && '--force' || '' }}
