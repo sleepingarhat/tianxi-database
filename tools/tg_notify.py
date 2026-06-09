@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram free-channel auto-poster for Tianxi (@TianxiPredict).
+"""Telegram free-channel auto-poster for Tianxi (@TX_Oracle).
 
 Zero third-party deps (stdlib only) for CI robustness.
 
@@ -11,7 +11,7 @@ Reads only the public API (https://tianxi.racing). Posts via Telegram Bot API.
 
 Env:
   TELEGRAM_BOT_TOKEN  (required)  bot token; bot must be admin of the channel.
-  TG_CHANNEL          (optional)  default @TianxiPredict
+  TG_CHANNEL          (optional)  default @TX_Oracle
   TX_API_BASE         (optional)  default https://tianxi.racing
   TX_SITE_BASE        (optional)  default https://tianxi-site.pages.dev
 """
@@ -27,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 HK_TZ = timezone(timedelta(hours=8))
 API_BASE = os.environ.get("TX_API_BASE", "https://tianxi.racing").rstrip("/")
 SITE_BASE = os.environ.get("TX_SITE_BASE", "https://tianxi-site.pages.dev").rstrip("/")
-CHANNEL = os.environ.get("TG_CHANNEL", "@TianxiPredict")
+CHANNEL = os.environ.get("TG_CHANNEL", "@TX_Oracle")
 MEMBERSHIP_URL = SITE_BASE + "/membership/"
 RESULTS_URL = SITE_BASE + "/results/"
 
