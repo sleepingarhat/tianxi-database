@@ -1,4 +1,4 @@
-# meeting=2026-06-10 racecourse=HV written=2026-06-08
+# meeting=2026-06-10 racecourse=HV written=2026-06-09
 D482
 E175
 E471
@@ -25,7 +25,6 @@ H407
 H439
 H440
 H454
-H456
 H481
 H486
 J043
@@ -53,7 +52,6 @@ J445
 J446
 J484
 J488
-J509
 J511
 J529
 J536
