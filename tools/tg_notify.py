@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Telegram free-channel auto-poster for Tianxi (@TianxiPredict).
+
+Zero third-party deps (stdlib only) for CI robustness.
+
+Subcommands:
+  prerace   Post the race-day preview + 1 free featured pick (morning of a HK race day).
+  postrace  Post the post-race hit-rate recap (after results land).
+
+Reads only the public API (https://tianxi.racing). Posts via Telegram Bot API.
+
+Env:
+  TELEGRAM_BOT_TOKEN  (required)  bot token; bot must be admin of the channel.
+  TG_CHANNEL          (optional)  default @TianxiPredict
+  TX_API_BASE         (optional)  default https://tianxi.racing
+  TX_SITE_BASE        (optional)  default https://tianxi-site.pages.dev
+"""
+import os
+import sys
+import json
+import html
+import argparse
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
+
+HK_TZ = timezone(timedelta(hours=8))
+API_BASE = os.environ.get("TX_API_BASE", "https://tianxi.racing").rstrip("/")
+SITE_BASE = os.environ.get("TX_SITE_BASE", "https://tianxi-site.pages.dev").rstrip("/")
+CHANNEL = os.environ.get("TG_CHANNEL", "@TianxiPredict")
+MEMBERSHIP_URL = SITE_BASE + "/membership/"
+RESULTS_URL = SITE_BASE + "/results/"
+
+WEEKDAY_CH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+VENUE_CH = {"ST": "沙田", "HV": "跑馬地"}
+
+DISCLAIMER = "免責：數據分析展示，非投注建議。只供 18 歲或以上人士，請量力而為，只透過合法渠道（香港賽馬會）進行。"
+CTA = '解鎖全卡預測、模型搏冷 + 市場穩陣雙欄、pWin 信心分：<a href="{url}">升級天喜 Pro</a>'.format(url=MEMBERSHIP_URL)
+
+
+def hk_today():
+    return datetime.now(HK_TZ).date()
+
+
+def fmt_date(iso):
+    try:
+        d = datetime.strptime(iso, "%Y-%m-%d").date()
+        return "%d月%d日（%s）" % (d.month, d.day, WEEKDAY_CH[d.weekday()])
+    except Exception:
+        return iso
+
+
+def api_get(path):
+    url = API_BASE + path
+    req = urllib.request.Request(url, headers={"User-Agent": "tx-tg-notify", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def tg_send(text):
+    if os.environ.get("TX_DRY_RUN"):
+        print("----- DRY RUN (would post to %s) -----" % CHANNEL)
+        print(text)
+        print("----- END DRY RUN -----")
+        return
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("ERROR: TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+        sys.exit(2)
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    payload = json.dumps({
+        "chat_id": CHANNEL,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+        if not resp.get("ok"):
+            print("ERROR: telegram responded not-ok: %s" % json.dumps(resp), file=sys.stderr)
+            sys.exit(3)
+        print("posted ok, message_id=%s" % resp.get("result", {}).get("message_id"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        print("ERROR: telegram HTTP %s: %s" % (e.code, body), file=sys.stderr)
+        sys.exit(3)
+
+
+def e(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+def venue_name(venue, fallback=None):
+    return VENUE_CH.get(venue, fallback or venue or "")
+
+
+def race_confidence(r):
+    picks = r.get("picks") or []
+    if len(picks) < 2:
+        return -1.0
+    def sc(p):
+        v = p.get("eloComposite")
+        return float(v) if v is not None else 0.0
+    return sc(picks[0]) - sc(picks[1])
+
+
+def pick_label(p):
+    num = p.get("horseNumber")
+    name = p.get("nameCh") or p.get("nameEn") or "?"
+    return "%s號 %s" % (e(num), e(name))
+
+
+def cmd_prerace(args):
+    data = api_get("/api/analyze/today-picks")
+    date = data.get("date")
+    if not date:
+        print("no upcoming meeting; skip")
+        return
+    today = hk_today().isoformat()
+    if date != today and not args.force:
+        print("upcoming meeting %s is not today (%s); skip" % (date, today))
+        return
+
+    venue = data.get("venue")
+    vname = venue_name(venue, data.get("venueName"))
+    races = [r for r in (data.get("races") or []) if (r.get("picks"))]
+    if not races:
+        print("no races with picks; skip")
+        return
+
+    best = max(races, key=race_confidence)
+    picks = best.get("picks") or []
+    top = picks[0]
+
+    lines = []
+    lines.append("<b>【天喜 TIANXI · 賽日預告】</b>")
+    head = "%s　%s" % (fmt_date(date), e(vname))
+    nrace = len(data.get("races") or [])
+    if nrace:
+        head += " — 共 %d 場" % nrace
+    lines.append(head)
+    lines.append("")
+
+    rno = best.get("raceNumber")
+    dist = best.get("distance")
+    rcls = best.get("class")
+    meta = []
+    if dist:
+        meta.append("%sm" % e(dist))
+    if rcls:
+        meta.append("第%s班" % e(rcls))
+    meta_s = ("（%s）" % "．".join(meta)) if meta else ""
+    lines.append("<b>今日免費精選 · 第 %s 場%s</b>" % (e(rno), meta_s))
+    lines.append("本場模型首選：<b>%s</b>" % pick_label(top))
+    jt = []
+    if top.get("jockeyCh"):
+        jt.append("騎師 " + e(top.get("jockeyCh")))
+    if top.get("trainerCh"):
+        jt.append("練馬 " + e(top.get("trainerCh")))
+    if jt:
+        lines.append("　" + "　".join(jt))
+    if len(picks) >= 3:
+        ref = "　／　".join(pick_label(p) for p in picks[1:3])
+        lines.append("參考位置：%s" % ref)
+
+    lines.append("")
+    lines.append(CTA)
+    lines.append("")
+    lines.append("<i>%s</i>" % e(DISCLAIMER))
+    tg_send("\n".join(lines))
+
+
+def latest_settled_date(today):
+    data = api_get("/api/meetings")
+    for m in (data.get("meetings") or []):
+        tr = m.get("totalRaces")
+        d = m.get("date")
+        if tr and tr > 0 and d and d <= today:
+            return d, m.get("venue")
+    return None, None
+
+
+def pct(v):
+    try:
+        return "%g%%" % float(v)
+    except Exception:
+        return "—"
+
+
+def cmd_postrace(args):
+    today = hk_today().isoformat()
+    if args.date:
+        date = args.date
+    else:
+        date, _ = latest_settled_date(today)
+    if not date:
+        print("no settled meeting found; skip")
+        return
+
+    data = api_get("/api/analyze/hit-rate?date=%s" % date)
+    summary = data.get("summary") or {}
+    n = summary.get("racesEvaluated") or 0
+    if not n:
+        print("no races evaluated for %s; skip" % date)
+        return
+
+    venue = data.get("venue")
+    vname = venue_name(venue)
+
+    lines = []
+    lines.append("<b>【天喜 TIANXI · 賽後復盤】</b>")
+    lines.append("%s　%s — 評估 %d 場" % (fmt_date(date), e(vname), n))
+    lines.append("")
+    lines.append("<b>模型命中率</b>")
+    t1 = summary.get("top1HitRate")
+    t1h = summary.get("top1Hits")
+    lines.append("單場首選命中：<b>%s</b>（%s/%d）" % (pct(t1), e(t1h), n))
+    t3 = summary.get("top3AnyHitRate")
+    t3h = summary.get("top3AnyHits")
+    lines.append("前三選任一入位：<b>%s</b>（%s/%d）" % (pct(t3), e(t3h), n))
+    qp = summary.get("qpHitRate")
+    if qp is not None:
+        lines.append("位置 Q（QP）命中：%s" % pct(qp))
+    q = summary.get("quinellaHitRate")
+    if q is not None:
+        lines.append("連贏命中：%s" % pct(q))
+
+    lines.append("")
+    lines.append('全卡逐場對賬：<a href="%s">預測與賽果</a>' % RESULTS_URL)
+    lines.append(CTA)
+    lines.append("")
+    lines.append("<i>%s</i>" % e(DISCLAIMER))
+    tg_send("\n".join(lines))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Tianxi Telegram free-channel poster")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p1 = sub.add_parser("prerace")
+    p1.add_argument("--force", action="store_true", help="post even if upcoming meeting is not today")
+    p1.set_defaults(func=cmd_prerace)
+    p2 = sub.add_parser("postrace")
+    p2.add_argument("--date", help="YYYY-MM-DD override (default: latest settled)")
+    p2.set_defaults(func=cmd_postrace)
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
