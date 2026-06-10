@@ -267,11 +267,12 @@ def build_extras(date, venue, data):
 
     pools = [
         ("FF", "四連環（任序首4）", 1),
-        ("TRIO", "三重彩（任序首3）", 4),
+        ("TRIO", "單T（任序首3）", 4),
+        ("TIERCE", "三重彩（依序首3）", 24),
         ("QUARTET", "四重彩（依序首4）", 24),
     ]
     win_of = {"FF": lambda tr, ff: ff, "TRIO": lambda tr, ff: tr,
-              "QUARTET": lambda tr, ff: ff}
+              "TIERCE": lambda tr, ff: tr, "QUARTET": lambda tr, ff: ff}
 
     body = []
     for race_no, cov4, trio_win, ff_win in payout_races:
