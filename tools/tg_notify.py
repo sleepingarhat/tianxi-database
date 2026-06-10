@@ -20,6 +20,7 @@ import sys
 import json
 import html
 import argparse
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -191,15 +192,32 @@ def pct(v):
 
 def cmd_postrace(args):
     today = hk_today().isoformat()
-    if args.date:
-        date = args.date
-    else:
-        date, _ = latest_settled_date(today)
+    # Results land in D1 via the parallel D1-sync workflow, which can finish
+    # slightly after this recap starts (both fire off the scraper). Poll until
+    # the settled meeting hit-rate is available; never crash red on a 404.
+    attempts = 1 if args.date else 12
+    date = args.date
+    data = None
+    for i in range(attempts):
+        if not args.date:
+            date, _ = latest_settled_date(today)
+        if date:
+            try:
+                data = api_get("/api/analyze/hit-rate?date=%s" % date)
+                break
+            except urllib.error.HTTPError as ex:
+                if ex.code != 404:
+                    raise
+                data = None
+        if i < attempts - 1:
+            time.sleep(30)
     if not date:
         print("no settled meeting found; skip")
         return
+    if data is None:
+        print("hit-rate not ready for %s after %d attempt(s); skip" % (date, attempts))
+        return
 
-    data = api_get("/api/analyze/hit-rate?date=%s" % date)
     summary = data.get("summary") or {}
     n = summary.get("racesEvaluated") or 0
     if not n:
