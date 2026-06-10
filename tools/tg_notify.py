@@ -23,6 +23,7 @@ import argparse
 import time
 import urllib.request
 import urllib.error
+import re
 from datetime import datetime, timezone, timedelta
 
 HK_TZ = timezone(timedelta(hours=8))
@@ -34,6 +35,7 @@ RESULTS_URL = SITE_BASE + "/results/"
 
 WEEKDAY_CH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 VENUE_CH = {"ST": "沙田", "HV": "跑馬地"}
+HKJC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 DISCLAIMER = "免責：數據分析展示，非投注建議。只供 18 歲或以上人士，請量力而為，只透過合法渠道（香港賽馬會）進行。"
 CTA = '解鎖全卡預測、模型搏冷 + 市場穩陣雙欄、pWin 信心分：<a href="{url}">升級天喜 Pro</a>'.format(url=MEMBERSHIP_URL)
@@ -190,6 +192,122 @@ def pct(v):
         return "—"
 
 
+def hkjc_dividends(date_iso, venue, race_no):
+    """Official HKJC dividends for one race -> {pool: amount_per_$10}.
+
+    The site's own D1 dividends are unreliable (amounts >= $1,000 get truncated
+    at the thousands comma), so the recap reads HKJC official directly.
+    Best-effort: raises on network error (caller catches).
+    """
+    d = date_iso.replace("-", "/")
+    url = ("https://racing.hkjc.com/racing/information/English/Racing/LocalResults.aspx"
+           "?RaceDate=%s&Racecourse=%s&RaceNo=%d" % (d, venue, race_no))
+    req = urllib.request.Request(url, headers={"User-Agent": HKJC_UA, "Accept": "text/html"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        raw = r.read().decode("utf-8", "replace")
+    t = re.sub(r"<script.*?</script>", " ", raw, flags=re.S)
+    t = re.sub(r"<style.*?</style>", " ", t, flags=re.S)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = t.replace("&nbsp;", " ")
+    t = re.sub(r"\s+", " ", t)
+    out = {}
+    for label, pool in (("TRIO", "TRIO"), ("FIRST 4", "FF"),
+                        ("QUARTET", "QUARTET"), ("TIERCE", "TIERCE")):
+        m = re.search(re.escape(label) + r"\s+[\d,]+\s+([\d,]+\.\d{2})", t)
+        if m:
+            try:
+                out[pool] = float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    return out
+
+
+def build_extras(date, venue, data):
+    """Coverage distribution (4/4, 4-of-3, 4-of-2, order-agnostic) + box-bet
+    payouts for the model top-4, shown only where boxing the 4 picks won.
+    """
+    races = data.get("races") or []
+    if not races:
+        return []
+
+    def nums(key, r):
+        out = []
+        for p in (r.get(key) or []):
+            v = p.get("horseNumber")
+            if v is not None:
+                out.append(v)
+        return out
+
+    cov_counts = {4: 0, 3: 0, 2: 0}
+    payout_races = []
+    for r in races:
+        m4 = nums("predictedTop4", r)
+        a4 = nums("actualTop4", r)
+        a3 = nums("actualTop3", r)
+        if not m4 or not a4:
+            continue
+        mset = set(m4)
+        cov4 = len([x for x in a4 if x in mset])
+        if cov4 in cov_counts:
+            cov_counts[cov4] += 1
+        trio_win = len(a3) == 3 and all(x in mset for x in a3)
+        ff_win = len(a4) == 4 and all(x in mset for x in a4)
+        if trio_win or ff_win:
+            payout_races.append((r.get("raceNumber"), cov4, trio_win, ff_win))
+
+    out = []
+    if cov_counts[4] or cov_counts[3] or cov_counts[2]:
+        out.append("<b>模型四揀覆蓋</b>（唔分名次）")
+        if cov_counts[4]:
+            out.append("全中 4/4：<b>%d</b> 場" % cov_counts[4])
+        if cov_counts[3]:
+            out.append("4 中 3：%d 場" % cov_counts[3])
+        if cov_counts[2]:
+            out.append("4 中 2：%d 場" % cov_counts[2])
+
+    pools = [
+        ("FF", "四連環（任序首4）", 1),
+        ("TRIO", "三重彩（任序首3）", 4),
+        ("QUARTET", "四重彩（依序首4）", 24),
+    ]
+    win_of = {"FF": lambda tr, ff: ff, "TRIO": lambda tr, ff: tr,
+              "QUARTET": lambda tr, ff: ff}
+
+    body = []
+    for race_no, cov4, trio_win, ff_win in payout_races:
+        try:
+            divs = hkjc_dividends(date, venue, race_no)
+        except Exception as ex:
+            print("dividend fetch failed R%s: %s" % (race_no, ex), file=sys.stderr)
+            continue
+        sub = []
+        for pool, name, units in pools:
+            if not win_of[pool](trio_win, ff_win):
+                continue
+            amt = divs.get(pool)
+            if amt is None:
+                continue
+            cost = units * 10
+            sub.append("　%s 箱 %d 注 $%d → 派 <b>$%s</b>（賺 $%s）" % (
+                name, units, cost,
+                format(int(round(amt)), ","),
+                format(int(round(amt - cost)), ",")))
+        if sub:
+            tag = "全中" if cov4 == 4 else ("4 中 %d" % cov4)
+            body.append("第%s場（%s）：" % (e(race_no), tag))
+            body.extend(sub)
+
+    if body:
+        if out:
+            out.append("")
+        out.append("<b>四揀複式・每注 $10 派幾多</b>（HKJC 官方派彩）")
+        out.extend(body)
+        out.append("買中嗰 4 隻打複式，一注 $10 起，本小利大。")
+
+    if out:
+        out.append("")
+    return out
+
 def cmd_postrace(args):
     today = hk_today().isoformat()
     # Results land in D1 via the parallel D1-sync workflow, which can finish
@@ -246,6 +364,7 @@ def cmd_postrace(args):
         lines.append("連贏命中：%s" % pct(q))
 
     lines.append("")
+    lines.extend(build_extras(date, venue, data))
     lines.append('全卡逐場對賬：<a href="%s">預測與賽果</a>' % RESULTS_URL)
     lines.append(CTA)
     lines.append("")
