@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+H208,768,07,10/06/26,跑馬地,草地,C+3,1000,好,4,3,40,黎昭昇,楊明綸,2-3/4,16,117,2 6 7,0.57.25,1191,P-/TT
 H208,709,08,20/05/26,跑馬地,草地,A,1000,好,4,3,41,黎昭昇,班德禮,3,16,116,3 5 8,0.57.51,1184,P/TT
 H208,630,06,22/04/26,跑馬地,草地,B,1000,好/快,4,5,41,黎昭昇,艾兆禮,2-1/2,17,116,4 4 6,0.57.14,1190,P/TT
 H208,587,05,08/04/26,跑馬地,草地,C+3,1000,好,4,4,43,黎昭昇,艾兆禮,3-3/4,10,118,4 5 5,0.57.09,1181,P/TT
