@@ -234,7 +234,7 @@ def build_extras(date, venue, data):
         out = []
         for p in (r.get(key) or []):
             v = p.get("horseNumber")
-            if v is not None:
+            if v not in (None, ""):
                 out.append(v)
         return out
 
@@ -247,6 +247,8 @@ def build_extras(date, venue, data):
         if not m4 or not a4:
             continue
         mset = set(m4)
+        if len(mset) != 4:
+            continue
         cov4 = len([x for x in a4 if x in mset])
         if cov4 in cov_counts:
             cov_counts[cov4] += 1
@@ -289,10 +291,12 @@ def build_extras(date, venue, data):
             if amt is None:
                 continue
             cost = units * 10
-            sub.append("　%s 箱 %d 注 $%d → 派 <b>$%s</b>（賺 $%s）" % (
+            net = int(round(amt - cost))
+            gain = ("賺 $%s" % format(net, ",")) if net >= 0 else ("蝕 $%s" % format(-net, ","))
+            sub.append("　%s 箱 %d 注 $%d → 派 <b>$%s</b>（%s）" % (
                 name, units, cost,
                 format(int(round(amt)), ","),
-                format(int(round(amt - cost)), ",")))
+                gain))
         if sub:
             tag = "全中" if cov4 == 4 else ("4 中 %d" % cov4)
             body.append("第%s場（%s）：" % (e(race_no), tag))
