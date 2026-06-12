@@ -164,3 +164,22 @@ jobs:
           done
           if [ "$FAILED" -eq 1 ]; then exit 1; fi
           echo "Racecard enrichment pushed to D1 successfully"
+
+      # Event-driven auto-chain: once the upcoming racecard is enriched in D1,
+      # immediately trigger the LGB predict workflow in tianxi-backend so coverage
+      # lands hours after declaration instead of waiting for its 20:00 UTC cron.
+      - name: Trigger LGB predict on tianxi-backend
+        if: steps.scrape.outputs.has_data == 'true' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_PAT: ${{ secrets.TIANXI_BACKEND_PAT }}
+        run: |
+          set -eu
+          if curl -fsSL -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/sleepingarhat/tianxi-backend/actions/workflows/lgb_predict_upcoming.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"days_ahead":"7"}}'; then
+            echo "Dispatched lgb_predict_upcoming on tianxi-backend (entries enriched -> predict)"
+          else
+            echo "::warning::Failed to dispatch lgb_predict_upcoming; 20:00 UTC cron remains as backup"
+          fi
