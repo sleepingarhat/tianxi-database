@@ -37,6 +37,16 @@ jobs:
           node-version: "22"
       - name: Install wrangler
         run: npm install -g wrangler@latest
+      # Regenerate the dev-log commit feed fresh at deploy time so the
+      # published data.json reflects the latest commits across all 3 repos.
+      # Non-fatal: if generation fails (e.g. token issue) the last committed
+      # baseline data.json still ships and the deploy is NOT blocked.
+      - name: Regenerate dev-log commit feed (non-fatal)
+        continue-on-error: true
+        working-directory: site
+        env:
+          GH_TOKEN: ${{ secrets.TIANXI_BACKEND_PAT }}
+        run: node scripts/gen-devlog.mjs
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
