@@ -19,7 +19,7 @@
 | Repo | 角色 | 技術棧 |
 |---|---|---|
 | **tianxi-database** (本 repo · public) | HKJC 爬取 · CSV 數據底 · GHA 調度 · Data audit | Python + GitHub Actions |
-| [**tianxi-backend**](https://github.com/sleepingarhat/tianxi-backend) (private) | D1 + Workers API · ELO 計算 · Composite prediction | Hono + TypeScript + Cloudflare D1 |
+| [**tianxi-backend**](https://github.com/sleepingarhat/tianxi-backend) (public) | D1 + Workers API · ELO 計算 · TX-Oracle v3.2 prediction | Hono + TypeScript + Cloudflare D1 |
 | [**tianxi-site**](https://github.com/sleepingarhat/tianxi-site) (public) | CF Pages 靜態前端 · HKJC 3-level layout | Vanilla HTML/CSS/JS |
 
 Production URLs：
@@ -42,7 +42,7 @@ Production URLs：
 | 練馬師 Profile | **67 位**（active roster） |
 | 騎師 Profile | **~100 位**（含 apprentice + freelance） |
 | Fixture 日曆 cache | **152 race days** (2025-2026) |
-| 每日自動 workflow | **10 條**（+ ELO Post-Race） |
+| GHA workflow 檔 | **19 個**（每日 cron + D1 sync + 部署 + TG 通知 + ELO Post-Race） |
 | 結構化數據總 size | ~90 MB CSV（`utf-8-sig`） |
 
 **消費模式：** 前端/ML/BI 直接 fetch GitHub raw CSV。零 server、零 DB 運維。
@@ -54,7 +54,7 @@ Production URLs：
 香港賽馬會（HKJC）官方只出 SPA + PDF，冇公開 structured API。
 天喜把 HKJC 11 年公開賽果抽象化成穩定 CSV schema，每日自動刷新，為下游 AI 產品（Elo / 選馬模型 / 賠率分析 / BI）提供可信數據層。
 
-- **全自動** — GitHub Actions cron，10 條 workflow 協同跑
+- **全自動** — GitHub Actions cron，19 個 workflow 協同跑
 - **賽日感知** — `fixture_guard` 非賽日自動跳過，每月慳 ~60% GHA minutes
 - **自愈** — 每日 sanity dashboard + integrity audit，遺漏自動開 Issue
 - **Idempotent** — 已存在檔案 skip，安全重跑
@@ -346,10 +346,10 @@ reports/
 
 **ELO v12 (`elo-post-race.yml`)** — 賽後即時跑（race_daily 完成觸發），增量更新 horse / jockey / trainer ELO。5 個 axis：`overall` · `turf_sprint` · `turf_mile` · `turf_middle` · `turf_staying`。Snapshot 規模 ~82K horse / 39K jockey / 37K trainer。
 
-**LightGBM lambdarank (`lgb_backfill.yml`)** — `tianxi-backend` 跑，graded labels (1/2/3 finishing pos 反映 placement quality)，val-tuned `τ_lgb` / `τ_elo`。Backfill 覆蓋 2025-09-03 → 今日（單日 workflow_dispatch 補新賽日）。
+**LightGBM lambdarank (`lgb_backfill.yml`)** — `tianxi-backend` 跑，graded labels (1/2/3 finishing pos 反映 placement quality)，val-tuned `τ_lgb` / `τ_elo`。**訓練窗口 2016-09-01 → 今日全歷史**（2026-05-28 擴展，~8,058 races / ~98k rows；單日 `workflow_dispatch` 可補新賽日）。
 
 **Ensemble blend** — `applyEnsembleBlend` 喺每場做 per-race z-norm：
-`finalScore = 1500 + (α·lgb_z + (1-α)·elo_z + factor·0.5)·100`，α=0.62（2026-05-22 73 賽日 / 712 場 tune 確認最優，composite=0.349 vs α=0.70=0.346）。
+`finalScore = 1500 + (α·lgb_z + (1-α)·elo_z + factor·0.5)·100`，nominal α=0.88（2026-05-31 升；每賽日由 `lgb_predict_upcoming.yml` auto-gate 自癒：PASS→0.88 / FAIL→0 純 ELO。舊 offline sweep 曾揀 α=0.62）。
 
 α tuner workflow（`alpha_tune.yml`，ADMIN_TOKEN-gated）+ server-side per-(date,alpha) cache，後續 re-tune 唔再食 wall clock。v11 ELO 已完全 retire（Batch 2 2026-05-22）。
 
@@ -454,7 +454,7 @@ const text = await res.text();
 **進行中 / 短期**
 - [ ] form_records 100% 覆蓋（1299/1300，單馬 gap 自動 heal）
 - [ ] HKJC 5/27 起 racecard 詳情賽前自動 enrich（T-1/T-2 publish window 監察）
-- [ ] LGB model 自動 nightly retrain（目前 manual `lgb_backfill.yml` dispatch）
+- [x] LGB model 自動 retrain（`lgb_predict_upcoming.yml` cron 04:00 HKT + `capy_racecard` 成功後 cross-repo dispatch；`lgb_backfill.yml` 補算）
 - [ ] τ_lgb / τ_elo 重 tune（與 α 同步定期 refresh）
 - [ ] Pool A `horse-injury` 並行化（目前單 thread ~160min，shard 後可縮到 ~40min）
 
@@ -479,7 +479,7 @@ HKJC 原始賽果為公開資訊，本 repo 只做 **結構化重組** 同 **sch
 - 系統規劃：[plan.md](./plan.md)
 - Data schema 詳情：[DATA_NOTES.md](./DATA_NOTES.md)
 
-*Maintained by Capy / GitHub Actions · 9 個 workflow 24/7 自主運行 · 每日自動數據完整性審計。*
+*Maintained by Capy / GitHub Actions · 19 個 workflow 24/7 自主運行 · 每日自動數據完整性審計。*
 
 
   ## 已知問題修復記錄
