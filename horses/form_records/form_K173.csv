@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+K173,791,06,21/06/26,沙田,草地,A,1400,好,G3,10,100,廖康銘,艾兆禮,3-1/2,22,117,7 9 10 6,1.20.94,1089,B
 K173,742,06,31/05/26,沙田,草地,B,1200,好/快,G3,9,100,廖康銘,艾兆禮,2-1/4,5.8,120,8 10 6,1.08.30,1084,B
 K173,684,02,09/05/26,沙田,草地,C,1200,好/黏,2,10,99,廖康銘,艾兆禮,1,25,129,12 12 2,1.09.23,1082,B
 K173,604,01,12/04/26,沙田,草地,C,1200,好,2,3,92,廖康銘,艾兆禮,鼻位,13,127,3 3 1,1.08.87,1083,B
