@@ -314,16 +314,31 @@ def build_extras(date, venue, data):
     return out
 
 def cmd_postrace(args):
-    today = hk_today().isoformat()
+    today_date = hk_today()
+    today = today_date.isoformat()
     # Results land in D1 via the parallel D1-sync workflow, which can finish
     # slightly after this recap starts (both fire off the scraper). Poll until
     # the settled meeting hit-rate is available; never crash red on a 404.
+    #
+    # Recency guard: the workflow_run trigger fires on EVERY results-scraper
+    # completion (incl. re-confirm runs on later days), so in auto mode only a
+    # meeting dated today or yesterday (HKT) is a fresh race day worth a recap.
+    # A stale latest-settled meeting is treated like "results not ready yet": we
+    # keep polling (so a race day landing mid-poll is still caught) and never
+    # post a stale recap. A manual --date dispatch bypasses the guard.
     attempts = 1 if args.date else 12
     date = args.date
     data = None
     for i in range(attempts):
         if not args.date:
             date, _ = latest_settled_date(today)
+            if date:
+                try:
+                    age = (today_date - datetime.strptime(date, "%Y-%m-%d").date()).days
+                except Exception:
+                    age = None
+                if age is None or age < 0 or age > 1:
+                    date = None  # stale/invalid: not a fresh race day to recap
         if date:
             try:
                 data = api_get("/api/analyze/hit-rate?date=%s" % date)
@@ -335,24 +350,11 @@ def cmd_postrace(args):
         if i < attempts - 1:
             time.sleep(30)
     if not date:
-        print("no settled meeting found; skip")
+        print("no fresh settled meeting (today/yesterday HKT) found; skip")
         return
     if data is None:
         print("hit-rate not ready for %s after %d attempt(s); skip" % (date, attempts))
         return
-
-    # Recency guard: only auto-post a recap within ~1 day of the race day. The
-    # workflow_run trigger fires on EVERY results-scraper completion (incl.
-    # re-confirm runs on later days), which would otherwise re-post a stale
-    # recap for an old meeting whenever no newer race day exists yet. A manual
-    # --date dispatch bypasses this.
-    if not args.date:
-        try:
-            if (hk_today() - datetime.strptime(date, "%Y-%m-%d").date()).days > 1:
-                print("latest settled meeting %s is >1 day old (today %s); skip stale recap" % (date, today))
-                return
-        except Exception:
-            pass
 
     summary = data.get("summary") or {}
     n = summary.get("racesEvaluated") or 0
