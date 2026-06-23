@@ -341,6 +341,19 @@ def cmd_postrace(args):
         print("hit-rate not ready for %s after %d attempt(s); skip" % (date, attempts))
         return
 
+    # Recency guard: only auto-post a recap within ~1 day of the race day. The
+    # workflow_run trigger fires on EVERY results-scraper completion (incl.
+    # re-confirm runs on later days), which would otherwise re-post a stale
+    # recap for an old meeting whenever no newer race day exists yet. A manual
+    # --date dispatch bypasses this.
+    if not args.date:
+        try:
+            if (hk_today() - datetime.strptime(date, "%Y-%m-%d").date()).days > 1:
+                print("latest settled meeting %s is >1 day old (today %s); skip stale recap" % (date, today))
+                return
+        except Exception:
+            pass
+
     summary = data.get("summary") or {}
     n = summary.get("racesEvaluated") or 0
     if not n:
