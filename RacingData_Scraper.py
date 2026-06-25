@@ -238,6 +238,15 @@ def parse_dividends(driver):
                 else:
                     pool = current_pool
                 dividends.append({"pool": pool, "combination": combination, "dividend_hkd": dividend})
+            elif len(cells) == 2:
+                # Dead-heat continuation row: the pool-label <td> carries a
+                # rowspan, so a 2nd+ winning combination renders with only
+                # (combination, dividend) and no label. Reuse current_pool so
+                # multi-combo dividends (ties for a place) are not dropped.
+                combination = safe_cell(cells, 0)
+                dividend = safe_cell(cells, 1)
+                if current_pool and combination:
+                    dividends.append({"pool": current_pool, "combination": combination, "dividend_hkd": dividend})
     except NoSuchElementException:
         pass
     except Exception:
