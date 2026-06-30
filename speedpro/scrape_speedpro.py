@@ -118,11 +118,11 @@ def main():
                 return 0
             out["venue"] = venue
 
-        try:
-            fg = fetch_json(fgfile)
-        except Exception as e:  # noqa: BLE001
-            print("::warning::fg fetch failed race {}: {}".format(rno, e))
-            fg = {}
+        # fg is part of the archive contract. SpeedPro is current-meeting-only
+        # (no backfill), so a persistent fg failure must RAISE (after
+        # fetch_json's own retries) and turn the workflow red rather than
+        # silently committing an incomplete, un-recoverable day.
+        fg = fetch_json(fgfile)
 
         out["races"].append({
             "raceno": int(rno),
@@ -132,6 +132,18 @@ def main():
             "formguide": strip_images(fg.get("SpeedPRO", [])),
         })
         time.sleep(1)  # be gentle on HKJC
+
+    # Completeness gate: SpeedPro is current-meeting-only (no backfill), so never
+    # commit a partial day. Fail loudly (workflow red) and let the next
+    # cron/dispatch retry rather than archiving holes we can never recover.
+    if len(out["races"]) != len(races):
+        raise RuntimeError("race count mismatch: got {} expected {}".format(
+            len(out["races"]), len(races)))
+    for rc in out["races"]:
+        if not rc["energy"]:
+            raise RuntimeError("race {} has empty energy grid".format(rc["raceno"]))
+        if not rc["formguide"]:
+            raise RuntimeError("race {} has empty formguide".format(rc["raceno"]))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, "{}_{}.json".format(date_iso, venue))
