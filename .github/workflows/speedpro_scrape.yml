@@ -1,0 +1,41 @@
+name: SpeedPro Speed Guide Scrape
+
+# Store-only: archives HKJC's pre-race SpeedPro 速勢圖 energy/form data per race
+# day into speedpro/data/. NOT fed into the engine. HKJC only publishes the
+# current meeting (no historical backfill), so this must run on race days going
+# forward; the scraper self-guards on sg_index.expiredate and HK venue (ST/HV).
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 09:00 HKT
+    - cron: '0 3 * * *'   # 11:00 HKT (catches race-morning scratchings)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: speedpro-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scrape SpeedPro speed guide
+        run: python speedpro/scrape_speedpro.py
+      - name: Commit data if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "speedpro: update speed-guide data ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git push
+          else
+            echo "No SpeedPro change."
+          fi
