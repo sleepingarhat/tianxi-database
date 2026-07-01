@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+G250,817,08,01/07/26,沙田,草地,C,1400,好/快,5,8,30,桂福特,霍宏聲,4-3/4,16,126,3 5 6 8,1.22.23,1183,V
 G250,626,09,22/04/26,跑馬地,草地,B,1650,好/快,5,6,31,桂福特,田泰安,11-1/4,20,127,6 6 6 9,1.41.45,1211,V
 G250,554,03,29/03/26,沙田,草地,A+3,1400,好/快,5,2,31,桂福特,霍宏聲,2-3/4,9.9,126,3 3 3 3,1.21.88,1221,V
 G250,386,12,28/01/26,跑馬地,草地,C,1650,好/快,5,4,31,桂福特,希威森,5-1/2,7.5,126,4 4 6 12,1.40.60,1224,V

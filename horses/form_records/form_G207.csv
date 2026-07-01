@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+G207,822,07,01/07/26,沙田,草地,C,1000,好/快,3,6,80,文家良,周俊樂,1-1/2,28,133,9 11 7,0.56.41,1218,B/TT
 G207,763,12,07/06/26,沙田,草地,C,1200,好,2,4,81,文家良,黃寶妮,6-1/4,103,111,8 9 12,1.09.63,1217,B/TT
 G207,722,11,24/05/26,沙田,草地,A,1400,好/快,2,5,81,文家良,黃寶妮,10-1/4,104,114,2 3 4 11,1.23.06,1217,B/TT
 G207,644,14,26/04/26,沙田,草地,A,1400,好/快,2,10,81,文家良,黃寶妮,10-3/4,160,108,7 8 9 14,1.22.18,1222,B/TT
