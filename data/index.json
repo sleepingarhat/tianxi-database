@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-07-02T05:37:11+00:00",
+  "generated_at": "2026-07-03T07:35:13+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "4341313fbec8e90f3cf4e1b4ec8cfc167f54068d",
+  "git_head": "74f6cd3250b322ebabb9a14961baa3f964e16a13",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -18,7 +18,7 @@
     "race_days": 921,
     "race_artefact_files": 4599,
     "fixtures_rows": 143,
-    "horse_form_files": 6045,
+    "horse_form_files": 6046,
     "horse_profile_rows": 6048,
     "jockey_record_files": 59,
     "jockey_profile_rows": 66,
@@ -95,7 +95,7 @@
       "form_records": {
         "dir": "horses/form_records/",
         "path_template": "horses/form_records/form_{horse_id}.csv",
-        "count": 6045,
+        "count": 6046,
         "sample": [
           "form_A001.csv",
           "form_A002.csv",
@@ -133,11 +133,11 @@
     "trials": {
       "results": {
         "path": "trials/trial_results.csv",
-        "row_count": 7011
+        "row_count": 7028
       },
       "sessions": {
         "path": "trials/trial_sessions.csv",
-        "row_count": 906
+        "row_count": 909
       },
       "note": "HKJC retains ~176 days only; pre-2025-03-13 irrecoverable"
     },
@@ -175,11 +175,11 @@
   "integrity": {
     "latest_report": "audit_reports/integrity_latest.json",
     "raw_url": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/audit_reports/integrity_latest.json",
-    "scan_date": "2026-07-02",
-    "overall_severity": "critical",
-    "critical_gap_count": 1,
+    "scan_date": "2026-07-03",
+    "overall_severity": "warn",
+    "critical_gap_count": 0,
     "warn_gap_count": 7,
-    "recommendation": "gha_next_delta_will_fix"
+    "recommendation": "monitor_no_block"
   },
   "policy": {
     "odds_weighting": "disabled (beta=0 hardcoded in win-probability model)",
