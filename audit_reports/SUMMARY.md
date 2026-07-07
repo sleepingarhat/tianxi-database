@@ -1,6 +1,6 @@
-# Data Integrity Audit · 2026-07-06
+# Data Integrity Audit · 2026-07-07
 
-**Overall:** 🟡 `warn`  ·  critical gaps: **0**  ·  warn gaps: 7
+**Overall:** 🟡 `warn`  ·  critical gaps: **0**  ·  warn gaps: 6
 
 **Recommendation:** `monitor_no_block`
 
@@ -17,4 +17,4 @@
 | trainer_profiles | 🟢 ok | 34 | 34 | 0 | 0 | total trainer profiles: 67 |
 | trainer_records | 🟢 ok | 67 | 67 | 0 | 0 |  |
 | trial_results | 🟢 ok | 1 | 1 | 0 | 0 | trial rows: 7056 |
-| entries_upcoming | 🟡 warn | 2 | 0 | 2 | 0 | 2 upcoming race days lack entries file |
+| entries_upcoming | 🟡 warn | 2 | 1 | 1 | 0 | 1 upcoming race days lack entries file |
