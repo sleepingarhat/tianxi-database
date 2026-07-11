@@ -1,4 +1,4 @@
-# Data Integrity Audit · 2026-07-10
+# Data Integrity Audit · 2026-07-11
 
 **Overall:** 🟡 `warn`  ·  critical gaps: **0**  ·  warn gaps: 7
 
@@ -10,8 +10,8 @@
 |---|---|---|---|---|---|---|
 | race_artefacts | 🟢 ok | 705 | 705 | 0 | 0 |  |
 | fixtures_cache | 🟢 ok | 1 | 143 | 0 | 0 | total cached race days: 143 |
-| horse_profiles | 🟢 ok | 1299 | 1299 | 0 | 0 | total profiles in DB: 6057 |
-| horse_form_records | 🟢 ok | 1299 | 1299 | 0 | 0 | total form_records files: 6057 |
+| horse_profiles | 🟢 ok | 1293 | 1293 | 0 | 0 | total profiles in DB: 6057 |
+| horse_form_records | 🟢 ok | 1293 | 1293 | 0 | 0 | total form_records files: 6057 |
 | jockey_profiles | 🟢 ok | 34 | 34 | 0 | 0 | total jockey profiles: 64 |
 | jockey_records | 🟡 warn | 64 | 59 | 5 | 0 | 5 jockey profiles have no records file |
 | trainer_profiles | 🟢 ok | 34 | 34 | 0 | 0 | total trainer profiles: 67 |
