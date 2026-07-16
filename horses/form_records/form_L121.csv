@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+L121,866,03,15/07/26,跑馬地,草地,C,1200,好,3,1,70,呂健威,何澤堯,1-1/4,5.8,129,6 5 3,1.09.46,1190,H
 L121,814,03,27/06/26,沙田,草地,B,1200,好,3,11,70,呂健威,何澤堯,2-3/4,25,126,12 10 3,1.08.90,1179,H
 L121,764,11,07/06/26,沙田,草地,C,1400,好,3,9,70,呂健威,何澤堯,12-1/2,9.7,130,11 9 9 11,1.23.19,1181,H
 L121,699,01,17/05/26,沙田,草地,C+3,1200,黏,3,7,64,呂健威,何澤堯,1/2,5.3,124,9 8 1,1.10.98,1198,H

@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+K558,862,11,15/07/26,跑馬地,草地,C,1200,好,4,7,47,大衛希斯,黃智弘,5-1/2,84,119,3 4 11,1.10.84,1097,TT1
 K558,788,14,21/06/26,沙田,草地,A,1200,好,4,13,50,大衛希斯,何澤堯,12-3/4,202,125,5 7 14,1.10.96,1104,H-
 K558,479,12,01/03/26,沙田,草地,B+2,1200,好,4,4,50,大衛希斯,艾道拿,4-3/4,36,126,9 9 12,1.10.52,1095,H
 K558,398,12,01/02/26,沙田,草地,B+2,1200,好,4,13,52,大衛希斯,艾道拿,5-1/4,81,127,14 14 12,1.10.13,1090,H
