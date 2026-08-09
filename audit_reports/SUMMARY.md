@@ -1,14 +1,14 @@
-# Data Integrity Audit · 2026-08-08
+# Data Integrity Audit · 2026-08-09
 
-**Overall:** 🟡 `warn`  ·  critical gaps: **0**  ·  warn gaps: 12
+**Overall:** 🔴 `critical`  ·  critical gaps: **10**  ·  warn gaps: 8
 
-**Recommendation:** `monitor_no_block`
+**Recommendation:** `gha_next_delta_will_fix`
 
 ## Per-category
 
 | Category | Severity | Expected | Present | Missing | Stale | Notes |
 |---|---|---|---|---|---|---|
-| race_artefacts | 🟡 warn | 720 | 715 | 5 | 0 | days with any missing artefact: 1 |
+| race_artefacts | 🔴 critical | 725 | 715 | 10 | 0 | days with any missing artefact: 2 |
 | fixtures_cache | 🟢 ok | 1 | 238 | 0 | 0 | total cached race days: 238 |
 | horse_profiles | 🟢 ok | 1255 | 1255 | 0 | 0 | total profiles in DB: 6063 |
 | horse_form_records | 🟢 ok | 1255 | 1255 | 0 | 0 | total form_records files: 6063 |
@@ -17,4 +17,19 @@
 | trainer_profiles | 🟢 ok | 34 | 34 | 0 | 0 | total trainer profiles: 67 |
 | trainer_records | 🟢 ok | 67 | 67 | 0 | 0 |  |
 | trial_results | 🟢 ok | 1 | 1 | 0 | 0 | trial rows: 7071 |
-| entries_upcoming | 🟡 warn | 2 | 0 | 2 | 0 | 2 upcoming race days lack entries file |
+| entries_upcoming | 🟡 warn | 3 | 0 | 3 | 0 | 3 upcoming race days lack entries file |
+
+### 🔴 race_artefacts — sample missing (first 20)
+
+```
+results_2026-08-06
+commentary_2026-08-06
+dividends_2026-08-06
+sectional_times_2026-08-06
+video_links_2026-08-06
+results_2026-08-09
+commentary_2026-08-09
+dividends_2026-08-09
+sectional_times_2026-08-09
+video_links_2026-08-09
+```
