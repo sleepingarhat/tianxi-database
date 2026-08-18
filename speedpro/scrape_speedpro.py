@@ -167,6 +167,17 @@ def main():
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
     print("::notice::wrote {} ({:.0f} KB, {} races, venue {})".format(
         path, os.path.getsize(path) / 1024, len(out["races"]), venue))
+
+    # Rebuild index.json (manifest for the tianxi-site /speedpro/ page).
+    import re as _re
+    entries = []
+    for fn in sorted(os.listdir(OUT_DIR)):
+        m = _re.match(r"^(\d{4}-\d{2}-\d{2})_(ST|HV)\.json$", fn)
+        if m:
+            entries.append({"date": m.group(1), "venue": m.group(2), "file": fn})
+    with open(os.path.join(OUT_DIR, "index.json"), "w", encoding="utf-8") as f:
+        json.dump({"meetings": entries}, f, ensure_ascii=False, separators=(",", ":"))
+    print("::notice::index.json rebuilt ({} meetings)".format(len(entries)))
     return 0
 
 
