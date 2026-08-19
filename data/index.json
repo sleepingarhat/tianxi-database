@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-08-18T04:51:33+00:00",
+  "generated_at": "2026-08-19T10:51:41+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "795da021ad226facf654a1d4f522c5d0f950533d",
+  "git_head": "77032eda0ed0264e617f60ade2d0e2235548168a",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -19,7 +19,7 @@
     "race_artefact_files": 4619,
     "fixtures_rows": 238,
     "horse_form_files": 6063,
-    "horse_profile_rows": 6065,
+    "horse_profile_rows": 6063,
     "jockey_record_files": 59,
     "jockey_profile_rows": 66,
     "trainer_profile_rows": 67,
@@ -90,7 +90,7 @@
     "horses": {
       "profiles": {
         "path": "horses/profiles/horse_profiles.csv",
-        "row_count": 6065
+        "row_count": 6063
       },
       "form_records": {
         "dir": "horses/form_records/",
