@@ -163,7 +163,7 @@ jobs:
             --file=scripts/migrate-horse-ids-d1-prepare.sql
 
           TABLES=$(wrangler d1 execute tianxi-db --remote --json \
-            --command="SELECT DISTINCT schema.name FROM sqlite_master AS schema JOIN pragma_table_info(schema.name) AS column WHERE schema.type = 'table' AND column.name = 'horse_id' ORDER BY schema.name" \
+            --command="SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE '%horse_id%' ORDER BY name" \
             | jq -r '.[].results[]?.name')
           while IFS= read -r TABLE; do
             [ -n "$TABLE" ] || continue
