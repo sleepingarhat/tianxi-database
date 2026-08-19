@@ -6,11 +6,9 @@ Each horse-data shard uploads a horse_profiles.csv equal to
 across shards because shards partition horse_no via CRC32.
 
 Dedup strategy for horse_profiles.csv:
-  Concat all shard copies, then drop_duplicates on horse_no keeping the
-  row with the latest profile_last_scraped. This correctly prefers
-  newly-scraped rows over stale baseline copies from other shards'
-  fresh checkouts — even when pandas sort ordering would otherwise pick
-  a stale baseline row as "last".
+  Canonicalize all shard rows, order them by public-profile check time,
+  then merge each horse field-by-field. A newer partial scrape can update
+  values it actually found but cannot erase older verified fields.
 
 Per-horse file merge (2026-04-30 Bug D fix):
   Each shard's artifact upload contains ALL ~5000 form/trackwork/injury
@@ -30,6 +28,18 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from horse_profile_fields import (
+    PROFILE_CSV_FIELDS,
+    canonicalize_row,
+    merge_profile_rows,
+    profile_completeness,
+)
+from tools.horse_profile_coverage import write_report
 
 
 def main(art_dir: str) -> int:
@@ -95,15 +105,37 @@ def main(art_dir: str) -> int:
 
     if dfs:
         concat = pd.concat(dfs, ignore_index=True)
-        if "profile_last_scraped" in concat.columns:
-            concat = concat.sort_values(
-                "profile_last_scraped", na_position="first"
+        records = [canonicalize_row(row) for row in concat.to_dict("records")]
+        concat = pd.DataFrame(records)
+        concat["_profile_sort_date"] = concat.get(
+            "profile_checked_at", concat.get("profile_last_scraped", "")
+        ).fillna("")
+        concat["_profile_completeness"] = [
+            profile_completeness(row) for row in records
+        ]
+        ordered = concat.sort_values(
+            ["_profile_sort_date", "_profile_completeness"],
+            na_position="first",
+        ).drop(columns=["_profile_sort_date", "_profile_completeness"])
+        merged_by_horse: dict[str, dict[str, str]] = {}
+        for row in ordered.to_dict("records"):
+            horse_no = str(row.get("horse_no") or "").strip()
+            if not horse_no:
+                continue
+            merged_by_horse[horse_no] = merge_profile_rows(
+                merged_by_horse.get(horse_no),
+                row,
             )
-        merged = concat.drop_duplicates(subset="horse_no", keep="last")
+        merged = pd.DataFrame(merged_by_horse.values()).reindex(
+            columns=PROFILE_CSV_FIELDS
+        )
         out = ROOT / "horses" / "profiles" / "horse_profiles.csv"
         out.parent.mkdir(parents=True, exist_ok=True)
-        merged.to_csv(out, index=False, encoding="utf-8-sig")
+        merged.to_csv(out, index=False, encoding="utf-8-sig", lineterminator="\n")
         print(f"merged {len(dfs)} shard(s) → {len(merged)} profile rows")
+        report_out = ROOT / "audit_reports" / "horse_profile_coverage_latest.json"
+        write_report(out, report_out)
+        print(f"wrote field coverage report → {report_out}")
     else:
         print("no horse_profiles.csv shards found")
 

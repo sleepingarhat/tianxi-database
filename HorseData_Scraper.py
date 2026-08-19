@@ -23,6 +23,14 @@ from comeback_detection import should_scrape, classify_status
 from lifecycle_helper import (
     compute_last_race_dates, backfill_lifecycle, load_horse_state, load_today_entries,
 )
+from horse_profile_fields import (
+    PROFILE_PARSER_VERSION,
+    PROFILE_CSV_FIELDS,
+    PROFILE_SOURCE_KIND,
+    PROFILE_SOURCE_URL,
+    merge_profile_rows,
+    parse_profile_html,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -41,7 +49,7 @@ RESULTS_DIR  = "data"
 PROFILES_DIR = os.path.join("horses", "profiles")
 FORM_DIR     = os.path.join("horses", "form_records")
 FAILED_LOG   = "failed_horses.log"
-BASE_HORSE_URL = "https://racing.hkjc.com/racing/information/Chinese/Horse/Horse.aspx?HorseNo={horse_no}"
+BASE_HORSE_URL = PROFILE_SOURCE_URL
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
 os.makedirs(FORM_DIR, exist_ok=True)
@@ -150,6 +158,34 @@ FORM_COLS = [
 
 today_iso = date.today().isoformat()
 
+
+def save_profiles(rows):
+    """Merge updates without allowing a partial public-page parse to erase truth."""
+    if not rows:
+        return
+    incoming = {str(row.get("horse_no", "")): row for row in rows if row.get("horse_no")}
+    existing_rows = []
+    if os.path.exists(profiles_file):
+        existing_rows = pd.read_csv(profiles_file, encoding="utf-8-sig").to_dict("records")
+    merged = []
+    seen = set()
+    for old in existing_rows:
+        code = str(old.get("horse_no", "")).strip()
+        if code in incoming:
+            merged.append(merge_profile_rows(old, incoming[code]))
+            seen.add(code)
+        else:
+            merged.append(old)
+    for code, row in incoming.items():
+        if code not in seen:
+            merged.append(merge_profile_rows(None, row))
+    pd.DataFrame(merged).reindex(columns=PROFILE_CSV_FIELDS).to_csv(
+        profiles_file,
+        index=False,
+        encoding="utf-8-sig",
+        lineterminator="\n",
+    )
+
 for i, (horse_no, decision) in enumerate(todo, 1):
     print(f"\n[{i}/{len(todo)}] Horse: {horse_no} ({decision.reason})")
     form_out = os.path.join(FORM_DIR, f"form_{horse_no}.csv")
@@ -174,42 +210,19 @@ for i, (horse_no, decision) in enumerate(todo, 1):
         "last_race_date": last_race_dates.get(horse_no, ""),
         "status": decision.new_status or classify_status(last_race_dates.get(horse_no)),
         "profile_last_scraped": today_iso,
+        "profile_checked_at": today_iso,
+        "profile_source_url": url,
+        "profile_source_kind": PROFILE_SOURCE_KIND,
+        "profile_parser_version": PROFILE_PARSER_VERSION,
     }
 
-    # Horse name from header
     try:
-        name_el = driver.find_element(By.XPATH, "//table[@class='horseProfile']//tr[1]//td[1]")
-        raw = name_el.text.strip().split("\n")[0]
-        profile["name"] = raw
-    except Exception:
-        pass
-
-    # Table 3: Country, Color/Sex, Import Type, Total Stakes, Win record
-    try:
-        t3 = tables[3].find_elements(By.TAG_NAME, "tr")
-        for row in t3:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) >= 3:
-                key = cells[0].text.strip().lower().replace(" ", "_").replace("/", "_").replace(".", "").replace("*", "")
-                val = cells[2].text.strip()
-                profile[key] = val
+        profile.update(parse_profile_html(driver.page_source, horse_no))
     except Exception as e:
-        print(f"  Warning (table3): {e}")
-
-    # Table 4: Owner, Rating, Sire, Dam, Dam's Sire (pedigree)
-    try:
-        t4 = tables[4].find_elements(By.TAG_NAME, "tr")
-        for row in t4:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) >= 3:
-                key = cells[0].text.strip().lower().replace(" ", "_").replace("'", "").replace("/", "_")
-                val = cells[2].text.strip().split("\n")[0]  # first line only for 'Same Sire'
-                profile[key] = val
-    except Exception as e:
-        print(f"  Warning (table4): {e}")
+        print(f"  Warning (profile parser): {e}")
 
     all_profiles.append(profile)
-    print(f"  Profile: {profile.get('name', '?')} | Sire: {profile.get('sire', '?')} | Dam: {profile.get('dam', '?')}")
+    print(f"  Profile: {profile.get('name', '?')} | Sire: {profile.get('父系', '?')} | Dam: {profile.get('母系', '?')}")
 
     # ── Form Records ─────────────────────────────────────────────────────
 
@@ -305,27 +318,14 @@ for i, (horse_no, decision) in enumerate(todo, 1):
         print(f"  Error extracting form records: {e}")
 
     # Save profiles incrementally every 20 horses.
-    # keep='last' so a rescan row replaces the prior one (lifecycle fields update).
     if i % 20 == 0 and all_profiles:
-        df = pd.DataFrame(all_profiles)
-        if os.path.exists(profiles_file):
-            existing = pd.read_csv(profiles_file, encoding="utf-8-sig")
-            df = pd.concat([existing, df], ignore_index=True).drop_duplicates(
-                subset="horse_no", keep="last"
-            )
-        df.to_csv(profiles_file, index=False, encoding="utf-8-sig")
+        save_profiles(all_profiles)
         all_profiles = []
         print(f"  [Checkpoint] Profiles saved.")
 
 # Final save
 if all_profiles:
-    df = pd.DataFrame(all_profiles)
-    if os.path.exists(profiles_file):
-        existing = pd.read_csv(profiles_file, encoding="utf-8-sig")
-        df = pd.concat([existing, df], ignore_index=True).drop_duplicates(
-            subset="horse_no", keep="last"
-        )
-    df.to_csv(profiles_file, index=False, encoding="utf-8-sig")
+    save_profiles(all_profiles)
 
 driver.quit()
 print("\nHorse profile scraping complete!")

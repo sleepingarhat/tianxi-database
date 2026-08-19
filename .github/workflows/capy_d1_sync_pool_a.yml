@@ -82,12 +82,18 @@ jobs:
 
       - name: Resolve --since window
         id: resolve
+        env:
+          INPUT_SINCE: ${{ github.event.inputs.since }}
         run: |
           set -eu
-          S="${{ github.event.inputs.since }}"
+          S="$INPUT_SINCE"
           if [ -z "$S" ]; then
             # 30-day lookback default to catch any recent trackwork/injury entries
             S=$(TZ=Asia/Hong_Kong date -d "today -30 days" +%Y-%m-%d)
+          fi
+          if ! printf '%s' "$S" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            echo "Invalid since date: $S" >&2
+            exit 2
           fi
           echo "since=$S" >> $GITHUB_OUTPUT
           echo "Resolved --since=$S"
@@ -124,6 +130,59 @@ jobs:
       - name: Install wrangler
         run: npm install -g wrangler@4
 
+      - name: Ensure fixed-profile columns exist in D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        working-directory: tianxi-backend
+        run: |
+          set -eu
+          INFO=$(wrangler d1 execute tianxi-db --remote --command="PRAGMA table_info(horse_profile_extra)" --json)
+          for SPEC in \
+            "season_stakes_raw TEXT" \
+            "season_stakes_int INTEGER" \
+            "current_trainer TEXT" \
+            "profile_checked_at TEXT"; do
+            COL=${SPEC%% *}
+            if printf '%s' "$INFO" | grep -q "\"name\": \"$COL\""; then
+              echo "exists: horse_profile_extra.$COL"
+            else
+              wrangler d1 execute tianxi-db --remote \
+                --command="ALTER TABLE horse_profile_extra ADD COLUMN $SPEC"
+            fi
+          done
+
+      - name: Canonicalize legacy D1 horse IDs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        working-directory: tianxi-backend
+        run: |
+          set -euo pipefail
+          wrangler d1 execute tianxi-db --remote \
+            --file=scripts/migrate-horse-ids-d1-prepare.sql
+
+          TABLES=$(wrangler d1 execute tianxi-db --remote --json \
+            --command="SELECT DISTINCT schema.name FROM sqlite_master AS schema JOIN pragma_table_info(schema.name) AS column WHERE schema.type = 'table' AND column.name = 'horse_id' ORDER BY schema.name" \
+            | jq -r '.[].results[]?.name')
+          while IFS= read -r TABLE; do
+            [ -n "$TABLE" ] || continue
+            if ! printf '%s' "$TABLE" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then
+              echo "Unsafe table name returned by sqlite_master: $TABLE" >&2
+              exit 2
+            fi
+            echo "canonicalizing $TABLE.horse_id"
+            wrangler d1 execute tianxi-db --remote \
+              --command="UPDATE \"$TABLE\" SET horse_id = (SELECT new_id FROM _horse_id_migration WHERE old_id = \"$TABLE\".horse_id) WHERE horse_id IN (SELECT old_id FROM _horse_id_migration)"
+          done <<< "$TABLES"
+
+          wrangler d1 execute tianxi-db --remote \
+            --file=scripts/migrate-horse-ids-d1-finalize.sql
+          REMAINING=$(wrangler d1 execute tianxi-db --remote --json \
+            --command="SELECT COUNT(*) AS count FROM horses WHERE id = code AND id NOT LIKE 'horse_%'" \
+            | jq -r '.[0].results[0].count')
+          test "$REMAINING" = "0"
+
       - name: Push Pool A delta to D1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -132,7 +191,7 @@ jobs:
         run: |
           set -eu
           # FK-parent-first order
-          ORDER=(horses horse_trackwork horse_injury horse_form_records)
+          ORDER=(horses horse_profile_extra horse_trackwork horse_injury horse_form_records)
           FAILED=0
           for t in "${ORDER[@]}"; do
             for f in /tmp/d1-delta/${t}-*.sql; do
@@ -156,5 +215,5 @@ jobs:
         run: |
           set -eu
           wrangler d1 execute tianxi-db --remote \
-            --command="SELECT 'horse_trackwork' AS tbl, COUNT(*) AS rows FROM horse_trackwork UNION ALL SELECT 'horse_injury', COUNT(*) FROM horse_injury UNION ALL SELECT 'horse_form_records', COUNT(*) FROM horse_form_records" \
+            --command="SELECT 'horse_profile_extra' AS tbl, COUNT(*) AS rows FROM horse_profile_extra UNION ALL SELECT 'horse_trackwork', COUNT(*) FROM horse_trackwork UNION ALL SELECT 'horse_injury', COUNT(*) FROM horse_injury UNION ALL SELECT 'horse_form_records', COUNT(*) FROM horse_form_records" \
             --json | tail -40
