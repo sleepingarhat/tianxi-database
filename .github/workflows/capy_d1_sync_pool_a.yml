@@ -73,7 +73,7 @@ jobs:
         with:
           repository: sleepingarhat/tianxi-backend
           path: tianxi-backend
-          token: ${{ secrets.TIANXI_BACKEND_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
       - uses: actions/setup-node@v4
