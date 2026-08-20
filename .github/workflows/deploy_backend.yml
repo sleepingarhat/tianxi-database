@@ -17,7 +17,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sleepingarhat/tianxi-backend
-          token: ${{ secrets.TIANXI_BACKEND_PAT }}
           ref: main
 
       - uses: actions/setup-node@v4
@@ -27,6 +26,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Configure membership session secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          MEMBERSHIP_SESSION_SECRET: ${{ secrets.MEMBERSHIP_SESSION_SECRET }}
+        run: |
+          test -n "$MEMBERSHIP_SESSION_SECRET"
+          printf '%s' "$MEMBERSHIP_SESSION_SECRET" | npx wrangler secret put MEMBERSHIP_SESSION_SECRET
 
       - name: Deploy to Cloudflare Workers
         run: npx wrangler deploy
