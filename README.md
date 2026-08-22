@@ -351,7 +351,7 @@ reports/
 **Ensemble blend** — `applyEnsembleBlend` 喺每場做 per-race z-norm：
 `finalScore = 1500 + (α·lgb_z + (1-α)·elo_z + factor·0.5)·100`，nominal α=0.88（2026-05-31 升；每賽日由 `lgb_predict_upcoming.yml` auto-gate 自癒：PASS→0.88 / FAIL→0 純 ELO。舊 offline sweep 曾揀 α=0.62）。
 
-α tuner workflow（`alpha_tune.yml`，ADMIN_TOKEN-gated）+ server-side per-(date,alpha) cache，後續 re-tune 唔再食 wall clock。v11 ELO 已完全 retire（Batch 2 2026-05-22）。
+α tuner workflow（`alpha_tune.yml`，ADMIN_TOKEN-gated）+ server-side per-(date,alpha) cache，後續 re-tune 唔再食 wall clock。
 
 ---
 
@@ -445,11 +445,6 @@ const text = await res.text();
   - `lgb_backfill.yml` 單日補算 workflow
   - `alpha_tune.yml` ADMIN_TOKEN-gated α 掃描 + per-(date,alpha) server cache
 - [x] **Public read-only API** — `https://tianxi.racing/api/*`（CF Worker apex domain），開放 `/api/meetings`、`/api/analyze/top-picks`、`/api/analyze/hit-rate`、`/api/analyze/today-picks`
-- [x] 全棧 cleanup（2026-05-22 → 05-25）
-  - Batch 2：v11 ELO strip、site `assets/shell.js` nav dedup
-  - Batch 3：horse/results 頁 API-driven 重寫
-  - Batch 4：qimen/meihua/timesfm exploration code 移除（~4,400+ 行）
-  - replit.md ops 戰報壓縮 65%
 
 **進行中 / 短期**
 - [ ] form_records 100% 覆蓋（1299/1300，單馬 gap 自動 heal）
