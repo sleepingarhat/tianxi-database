@@ -2,7 +2,7 @@ name: TG Notify — Pre-race (free pick)
 
 on:
   schedule:
-    - cron: '0 4 * * *'   # 12:00 HKT race-day noon
+    - cron: '0 1 * * *'   # 09:00 HKT race-day morning
   workflow_dispatch:
     inputs:
       force:
