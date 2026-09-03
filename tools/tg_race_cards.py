@@ -57,7 +57,7 @@ def horse_meta(p):
         bits.append("檔%s" % p.get("draw"))
     wt = p.get("actualWeight") or p.get("declaredWeight") or p.get("weight")
     if wt not in (None, ""):
-        bits.append("%s磨" % str(wt).replace("磨", ""))
+        bits.append("%s磅" % str(wt).replace("磅", ""))
     st = p.get("runningStyle") or p.get("styleLabel") or p.get("style") or ""
     if st and str(st)[:1] in "放前中後":
         bits.append(str(st)[:1])
