@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Per-race Telegram cards for @TX_Oracle."""
+"""Per-race + meeting PDF posters for @TX_Oracle (sendDocument)."""
 from __future__ import annotations
-import argparse, html, json, os, sys, time, urllib.error, urllib.request
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tx_poster import render_meeting, render_post, render_pre, tg_send_document
 
 HK_TZ = timezone(timedelta(hours=8))
-API_BASE = os.environ.get("TX_API_BASE", "https://tianxi.racing").rstrip("/")
-SITE_BASE = os.environ.get("TX_SITE_BASE", "https://www.tianxi.racing").rstrip("/")
+API_BASE = os.environ.get("TX_API_BASE", "https://www.tianxi.racing").rstrip("/")
 CHANNEL = os.environ.get("TG_CHANNEL", "@TX_Oracle")
-WEEKDAY_CH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 VENUE_CH = {"ST": "沙田", "HV": "跑馬地"}
-DISCLAIMER = "免責：數據分析展示，非投注建議。只供 18 歲或以上人士。"
+WEEKDAY_CH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
-def e(s):
-    return html.escape(str(s if s is not None else ""))
 
 def hk_today():
     return datetime.now(HK_TZ).date()
+
 
 def fmt_date(iso):
     try:
@@ -25,30 +33,38 @@ def fmt_date(iso):
     except Exception:
         return iso
 
+
 def api_get(path):
-    req = urllib.request.Request(API_BASE + path, headers={"User-Agent": "tx-tg-cards", "Accept": "application/json"})
+    req = urllib.request.Request(
+        API_BASE + path,
+        headers={"User-Agent": "tx-tg-cards", "Accept": "application/json"},
+    )
     with urllib.request.urlopen(req, timeout=40) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def tg_send(text):
-    if os.environ.get("TX_DRY_RUN"):
-        print(text); return
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        sys.exit(2)
-    url = "https://api.telegram.org/bot%s/sendMessage" % token
-    payload = json.dumps({"chat_id": CHANNEL, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=40) as r:
-        resp = json.loads(r.read().decode("utf-8"))
-    if not resp.get("ok"):
-        sys.exit(3)
-    print("posted ok", resp.get("result", {}).get("message_id"))
 
 def venue_name(venue, fallback=None):
     return VENUE_CH.get(venue, fallback or venue or "")
 
-def pick_nums(items, key="horseNumber"):
+
+def horse_meta(p):
+    bits = []
+    if p.get("jockeyCh") or p.get("jockey"):
+        bits.append(p.get("jockeyCh") or p.get("jockey"))
+    if p.get("trainerCh") or p.get("trainer"):
+        bits.append(p.get("trainerCh") or p.get("trainer"))
+    if p.get("draw") not in (None, ""):
+        bits.append("檔%s" % p.get("draw"))
+    wt = p.get("actualWeight") or p.get("declaredWeight") or p.get("weight")
+    if wt not in (None, ""):
+        bits.append("%s磨" % str(wt).replace("磨", ""))
+    st = p.get("runningStyle") or p.get("styleLabel") or p.get("style") or ""
+    if st and str(st)[:1] in "放前中後":
+        bits.append(str(st)[:1])
+    return " · ".join(str(x) for x in bits)
+
+
+def nums(items, key="horseNumber"):
     out = []
     for p in items or []:
         v = p.get(key) if isinstance(p, dict) else p
@@ -56,42 +72,76 @@ def pick_nums(items, key="horseNumber"):
             out.append(str(v))
     return out
 
-def horse_meta(p):
-    bits = []
-    if p.get("jockeyCh") or p.get("jockey"): bits.append(p.get("jockeyCh") or p.get("jockey"))
-    if p.get("trainerCh") or p.get("trainer"): bits.append(p.get("trainerCh") or p.get("trainer"))
-    if p.get("draw") not in (None, ""): bits.append("檔%s" % p.get("draw"))
-    wt = p.get("actualWeight") or p.get("declaredWeight") or p.get("weight")
-    if wt not in (None, ""): bits.append("%s磅" % str(wt).replace("磅", ""))
-    st = p.get("runningStyle") or p.get("styleLabel") or p.get("style") or ""
-    if st and str(st)[:1] in "放前中後": bits.append(str(st)[:1])
-    return " · ".join(str(x) for x in bits)
+
+def payout_rows(race):
+    rows = []
+    raw = race.get("boxPayouts") or []
+    if isinstance(raw, dict):
+        raw = [{"pool": k, "payout": v} for k, v in raw.items()]
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pool = item.get("pool") or item.get("name") or item.get("code")
+        pay = item.get("payout") or item.get("dividend") or item.get("win")
+        if pool and pay not in (None, "", 0, "0"):
+            s = str(pay)
+            if not s.startswith("$"):
+                s = "$" + s
+            rows.append({"pool": str(pool), "payout": s})
+    if rows:
+        return rows
+    flags = [
+        (race.get("qpHit"), "位置Q"),
+        (race.get("quinellaHit"), "連贏"),
+        (race.get("top1Hit"), "獨贏"),
+        (race.get("trioHit"), "單T"),
+        (race.get("first4Hit"), "四連環"),
+    ]
+    for hit, name in flags:
+        if hit:
+            rows.append({"pool": name, "payout": "—"})
+            break
+    return rows
+
 
 def cmd_prerace(args):
     data = api_get("/api/analyze/today-picks")
     date = data.get("date")
     if not date:
-        print("no meeting"); return
+        print("no meeting")
+        return
     if date != hk_today().isoformat() and not args.force:
-        print("not today"); return
-    races = [r for r in (data.get("races") or []) if r.get("picks")]
+        print("not today", date)
+        return
     vname = venue_name(data.get("venue"), data.get("venueName"))
-    for r in races:
+    date_line_base = "%s　%s" % (fmt_date(date), vname)
+    for r in data.get("races") or []:
         picks = sorted(r.get("picks") or [], key=lambda p: p.get("rank") or 99)[:4]
-        lines = ["<b>TX-ORACLE天喜引擎 · 賽前預測</b>", "%s　%s　第 %s 場" % (fmt_date(date), e(vname), e(r.get("raceNumber")))]
+        if len(picks) < 1:
+            continue
         meta = []
-        if r.get("distance"): meta.append("%sm" % r.get("distance"))
-        if r.get("class"): meta.append("第%s班" % r.get("class"))
-        if meta: lines.append(" · ".join(str(x) for x in meta))
-        lines.append("")
-        for i, p in enumerate(picks, 1):
-            name = p.get("nameCh") or p.get("nameEn") or "?"
-            line = "%d. %s號 %s" % (i, e(p.get("horseNumber")), e(name))
-            extra = horse_meta(p)
-            if extra: line += "\n    %s" % e(extra)
-            lines.append(line)
-        lines += ["", '<a href="%s/cards/">網站</a>' % SITE_BASE, "<i>%s</i>" % e(DISCLAIMER)]
-        tg_send("\n".join(lines)); time.sleep(1.2)
+        if r.get("distance"):
+            meta.append("%s米" % r.get("distance"))
+        if r.get("class"):
+            meta.append("第%s班" % r.get("class"))
+        if r.get("going"):
+            meta.append(r.get("going"))
+        payload = {
+            "date_line": "%s　第 %s 場" % (date_line_base, r.get("raceNumber")),
+            "meta": " · ".join(str(x) for x in meta),
+            "picks": [
+                {
+                    "no": p.get("horseNumber"),
+                    "name": p.get("nameCh") or p.get("nameEn") or "",
+                    "sub": horse_meta(p),
+                }
+                for p in picks
+            ],
+        }
+        _png, pdf = render_pre(payload, dest="TX-R%s-pre" % r.get("raceNumber"))
+        tg_send_document(pdf, "TX-ORACLE · 第%s場" % r.get("raceNumber"))
+        time.sleep(1.2)
+
 
 def latest_settled(today):
     data = api_get("/api/meetings")
@@ -100,53 +150,91 @@ def latest_settled(today):
             return m.get("date"), m.get("venue")
     return None, None
 
+
+def load_hit(date):
+    return api_get("/api/analyze/hit-rate?date=%s" % date)
+
+
 def cmd_postrace(args):
     today = hk_today().isoformat()
     date = args.date or latest_settled(today)[0]
     if not date:
-        print("no settled"); return
+        print("no settled")
+        return
     try:
-        data = api_get("/api/analyze/hit-rate?date=%s" % date)
+        data = load_hit(date)
     except urllib.error.HTTPError as ex:
-        if ex.code == 404: return
+        if ex.code == 404:
+            return
         raise
     vname = venue_name(data.get("venue"))
+    date_line_base = "%s　%s" % (fmt_date(date), vname)
     for r in data.get("races") or []:
-        pred = pick_nums(r.get("predictedTop4"))
-        act4 = pick_nums(r.get("actualTop4"))
-        act3 = pick_nums(r.get("actualTop3"))
-        both = [x for x in act4 if x in set(pred)]
-        trio = len(act3) == 3 and all(x in set(pred) for x in act3)
-        first4 = len(act4) == 4 and all(x in set(pred) for x in act4)
-        win = bool(pred and act4 and pred[0] == act4[0])
-        quin = len(pred[:2]) == 2 and set(pred[:2]) == set(act4[:2])
-        qp = len(pred[:2]) == 2 and all(x in set(act3) for x in pred[:2])
-        lines = [
-            "<b>TX-ORACLE天喜引擎 · 預測與賽果比對</b>",
-            "%s　%s　第 %s 場" % (fmt_date(date), e(vname), e(r.get("raceNumber"))),
-            "",
-            "模型首四　%s" % e(" ".join(pred) or "—"),
-            "賽果頭四　%s" % e(" ".join(act4) or "—"),
-            "命中　<b>%d/4</b>" % len(both),
-        ]
+        pred = nums(r.get("predictedTop4"))
+        act4 = nums(r.get("actualTop4"))
+        if not pred and not act4:
+            continue
+        payload = {
+            "date_line": "%s　第 %s 場" % (date_line_base, r.get("raceNumber")),
+            "pred": pred,
+            "actual": act4,
+            "payouts": payout_rows(r),
+        }
+        _png, pdf = render_post(payload, dest="TX-R%s-post" % r.get("raceNumber"))
+        tg_send_document(pdf, "TX-ORACLE · 第%s場 比對" % r.get("raceNumber"))
+        time.sleep(1.2)
+
+
+def cmd_day(args):
+    today = hk_today().isoformat()
+    date = args.date or latest_settled(today)[0]
+    if not date:
+        print("no settled")
+        return
+    try:
+        data = load_hit(date)
+    except urllib.error.HTTPError as ex:
+        if ex.code == 404:
+            return
+        raise
+    vname = venue_name(data.get("venue"))
+    races = []
+    for r in data.get("races") or []:
+        picks = []
         hits = []
-        if win: hits.append("頭馬 命中")
-        if qp: hits.append("位置Q 命中")
-        if quin: hits.append("連贏 命中")
-        if trio: hits.append("單T 命中")
-        if first4: hits.append("四連環 命中")
-        if hits:
-            lines.append("")
-            lines.extend(hits)
-        lines += ["", '<a href="%s/cards/">網站</a>' % SITE_BASE, "<i>%s</i>" % e(DISCLAIMER)]
-        tg_send("\n".join(lines)); time.sleep(1.2)
+        for p in (r.get("predictedTop4") or [])[:4]:
+            no = str(p.get("horseNumber"))
+            picks.append({"no": no, "name": p.get("nameCh") or p.get("nameEn") or ""})
+            if p.get("hit"):
+                hits.append(no)
+        if not picks:
+            continue
+        races.append({"n": r.get("raceNumber"), "picks": picks, "hits": hits})
+    if not races:
+        print("no races")
+        return
+    _png, pdf = render_meeting(
+        {"date_line": "%s　%s" % (fmt_date(date), vname), "races": races},
+        dest="TX-%s-day" % date,
+    )
+    tg_send_document(pdf, "TX-ORACLE · %s 全日比對" % date)
+
 
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p1 = sub.add_parser("prerace-races"); p1.add_argument("--force", action="store_true"); p1.set_defaults(func=cmd_prerace)
-    p2 = sub.add_parser("postrace-races"); p2.add_argument("--date"); p2.set_defaults(func=cmd_postrace)
-    args = ap.parse_args(); args.func(args)
+    p1 = sub.add_parser("prerace-races")
+    p1.add_argument("--force", action="store_true")
+    p1.set_defaults(func=cmd_prerace)
+    p2 = sub.add_parser("postrace-races")
+    p2.add_argument("--date")
+    p2.set_defaults(func=cmd_postrace)
+    p3 = sub.add_parser("day")
+    p3.add_argument("--date")
+    p3.set_defaults(func=cmd_day)
+    args = ap.parse_args()
+    args.func(args)
+
 
 if __name__ == "__main__":
     main()
