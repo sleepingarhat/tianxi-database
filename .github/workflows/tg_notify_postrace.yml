@@ -36,11 +36,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python3 tools/tg_notify.py postrace ${{ inputs.date && format('--date {0}', inputs.date) || '' }}
-      - name: Post per-race comparison PDFs
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          python3 tools/tg_race_cards.py postrace-races ${{ inputs.date && format('--date {0}', inputs.date) || '' }}
       - name: Post full-day comparison PDF
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
