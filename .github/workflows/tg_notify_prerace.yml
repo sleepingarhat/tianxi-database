@@ -1,12 +1,8 @@
 name: TG Notify — Pre-race (free pick)
 
-# Posts the race-day preview + 1 free featured pick to the public Telegram
-# channel on the morning of a HK race day. Reads only the public API; the
-# script skips silently when the upcoming meeting is not today.
-
 on:
   schedule:
-    - cron: '0 1 * * *'   # 09:00 HKT — after LGB predict (04:00 HKT) settles
+    - cron: '0 1 * * *'   # 09:00 HKT
   workflow_dispatch:
     inputs:
       force:
@@ -21,12 +17,6 @@ permissions:
 
 jobs:
   season_gate:
-    # 休季自動化 (2026-08-18): scheduled runs short-circuit during the HK
-    # off-season. Status comes from the backend /api/season (D1-derived:
-    # no future ST/HV meeting + >12-day gap = off_season; admin override
-    # via app_settings season_mode). Fail-open: any curl/parse failure is
-    # treated as in_season so we never skip a real race day. Manual
-    # dispatch / workflow_run triggers are NEVER gated.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -41,7 +31,7 @@ jobs:
             echo "season status: ${STATUS:-unknown (fail-open)}"
             if [ "$STATUS" = "off_season" ]; then
               SKIP=true
-              echo "::notice::休季中 off-season — skipping scheduled run (auto-resumes when the new season racecard appears)"
+              echo "::notice::休季中 off-season — skipping scheduled run"
             fi
           fi
           echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
@@ -50,7 +40,7 @@ jobs:
     needs: season_gate
     if: needs.season_gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,8 +48,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Post pre-race preview
+      - name: Post pre-race day digest
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python3 tools/tg_notify.py prerace ${{ inputs.force == 'true' && '--force' || '' }}
+      - name: Post per-race prediction cards
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python3 tools/tg_race_cards.py prerace-races ${{ inputs.force == 'true' && '--force' || '' }}
