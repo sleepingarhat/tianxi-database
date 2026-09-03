@@ -104,19 +104,15 @@ def payout_rows(race):
     return rows
 
 
-def cmd_prerace(args):
-    data = api_get("/api/analyze/today-picks")
-    date = data.get("date")
-    if not date:
-        print("no meeting")
-        return
-    if date != hk_today().isoformat() and not args.force:
-        print("not today", date)
-        return
+def send_pre_races(data, date, only_first=False):
     vname = venue_name(data.get("venue"), data.get("venueName"))
     date_line_base = "%s　%s" % (fmt_date(date), vname)
-    for r in data.get("races") or []:
-        picks = sorted(r.get("picks") or [], key=lambda p: p.get("rank") or 99)[:4]
+    races = data.get("races") or []
+    if only_first:
+        races = races[:1]
+    for r in races:
+        picks = r.get("picks") or r.get("predictedTop4") or []
+        picks = sorted(picks, key=lambda p: p.get("rank") or 99)[:4]
         if len(picks) < 1:
             continue
         meta = []
@@ -141,6 +137,22 @@ def cmd_prerace(args):
         _png, pdf = render_pre(payload, dest="TX-R%s-pre" % r.get("raceNumber"))
         tg_send_document(pdf, "TX-ORACLE · 第%s場" % r.get("raceNumber"))
         time.sleep(1.2)
+
+
+def cmd_prerace(args):
+    if getattr(args, "date", None):
+        data = load_hit(args.date)
+        send_pre_races(data, args.date, only_first=True)
+        return
+    data = api_get("/api/analyze/today-picks")
+    date = data.get("date")
+    if not date:
+        print("no meeting")
+        return
+    if date != hk_today().isoformat() and not args.force:
+        print("not today", date)
+        return
+    send_pre_races(data, date, only_first=False)
 
 
 def latest_settled(today):
@@ -169,7 +181,10 @@ def cmd_postrace(args):
         raise
     vname = venue_name(data.get("venue"))
     date_line_base = "%s　%s" % (fmt_date(date), vname)
-    for r in data.get("races") or []:
+    races = data.get("races") or []
+    if getattr(args, "one", False):
+        races = races[:1]
+    for r in races:
         pred = nums(r.get("predictedTop4"))
         act4 = nums(r.get("actualTop4"))
         if not pred and not act4:
@@ -225,9 +240,11 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p1 = sub.add_parser("prerace-races")
     p1.add_argument("--force", action="store_true")
+    p1.add_argument("--date")
     p1.set_defaults(func=cmd_prerace)
     p2 = sub.add_parser("postrace-races")
     p2.add_argument("--date")
+    p2.add_argument("--one", action="store_true")
     p2.set_defaults(func=cmd_postrace)
     p3 = sub.add_parser("day")
     p3.add_argument("--date")
