@@ -11,6 +11,9 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      date:
+        description: 'YYYY-MM-DD historical test (uses hit-rate predicted top4, first race only)'
+        required: false
 
 permissions:
   contents: read
@@ -54,6 +57,7 @@ jobs:
           sudo apt-get install -y fonts-noto-cjk
           pip install pillow
       - name: Post pre-race day digest
+        if: ${{ inputs.date == '' || inputs.date == null }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
@@ -62,4 +66,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          python3 tools/tg_race_cards.py prerace-races ${{ inputs.force == 'true' && '--force' || '' }}
+          if [ -n "${{ inputs.date }}" ]; then
+            python3 tools/tg_race_cards.py prerace-races --date ${{ inputs.date }}
+          else
+            python3 tools/tg_race_cards.py prerace-races ${{ inputs.force == 'true' && '--force' || '' }}
+          fi
