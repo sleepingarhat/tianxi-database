@@ -48,12 +48,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Fonts + Pillow
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          pip install pillow
       - name: Post pre-race day digest
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python3 tools/tg_notify.py prerace ${{ inputs.force == 'true' && '--force' || '' }}
-      - name: Post per-race prediction cards
+      - name: Post per-race prediction PDFs
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
