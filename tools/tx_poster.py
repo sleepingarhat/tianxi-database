@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TX-ORACLE racebill posters — certificate style + meeting grid."""
+"""TX-ORACLE locked poster templates (font only, no AI text).\n\nVisual lock = approved 7月15日 cards.\nVariable slots only: date, venue, race, meta, horse no/name/sub, results, payouts.\n"""
 from __future__ import annotations
 
 import json, os, urllib.request
@@ -55,12 +55,7 @@ def frame(im: Image.Image, d: ImageDraw.ImageDraw, w: int, h: int) -> None:
     d.rectangle([M, M, w - M, h - M], outline=GOLD_DEEP, width=4)
     d.rectangle([M + 10, M + 10, w - M - 10, h - M - 10], outline=LINE, width=1)
     L = 28
-    for x, y, dx, dy in (
-        (M, M, 1, 1),
-        (w - M, M, -1, 1),
-        (M, h - M, 1, -1),
-        (w - M, h - M, -1, -1),
-    ):
+    for x, y, dx, dy in ((M, M, 1, 1), (w - M, M, -1, 1), (M, h - M, 1, -1), (w - M, h - M, -1, -1)):
         d.line([(x, y + dy * L), (x, y), (x + dx * L, y)], fill=GOLD_DEEP, width=4)
 
 
@@ -115,7 +110,6 @@ def render_pre(race: dict, dest: str = "tx_poster_pre"):
     d.text((W / 2, 154), race.get("date_line", ""), font=F(SERIF_B, 48), fill=INK, anchor="mt")
     flourish(d, 228)
     d.text((W / 2, 248), race.get("meta", ""), font=F(SERIF_R, 28), fill=MUTE, anchor="mt")
-
     picks = race.get("picks") or []
     y = 310
     row_h = 198
@@ -134,19 +128,6 @@ def render_pre(race: dict, dest: str = "tx_poster_pre"):
             d.ellipse([x, y + 128, x + 3, y + 131], fill=LINE)
             x += 10
         y += row_h
-
-    chips = [str(p.get("no", "")) for p in picks[:4]]
-    cw, ch, gap = 168, 92, 20
-    total = len(chips) * cw + max(0, len(chips) - 1) * gap
-    x = (W - total) / 2
-    cy = y - 36
-    if cy + ch > H - M - 24:
-        cy = H - M - 24 - ch
-    for n in chips:
-        d.rounded_rectangle([x, cy, x + cw, cy + ch], radius=18, outline=GOLD_DEEP, width=3)
-        d.text((x + cw / 2, cy + ch / 2), n, font=F(SERIF_B, 46), fill=INK, anchor="mm")
-        x += cw + gap
-
     OUT.mkdir(parents=True, exist_ok=True)
     png, pdf = OUT / f"{dest}.png", OUT / f"{dest}.pdf"
     im.save(png)
@@ -162,23 +143,21 @@ def render_post(race: dict, dest: str = "tx_poster_post"):
     ornament(d, 136)
     d.text((W / 2, 154), race.get("date_line", ""), font=F(SERIF_B, 48), fill=INK, anchor="mt")
     flourish(d, 228)
-
     pred = [str(x) for x in (race.get("pred") or [])][:4]
     actual = [str(x) for x in (race.get("actual") or [])][:4]
     hit = set(pred) & set(actual)
     lx, rx = 340, 740
-    d.text((lx, 262), "模型首四", font=F(SANS_R, 22), fill=MUTE, anchor="mt")
-    d.text((rx, 262), "賽果頭四", font=F(SANS_R, 22), fill=MUTE, anchor="mt")
-    d.text((W / 2, 262), f"命中 {len(hit)}/4", font=F(SERIF_B, 26), fill=GOLD, anchor="mt")
-    d.line([(540, 310), (540, 1188)], fill=LINE, width=1)
-    yy = 310
+    d.text((lx, 268), "模型首四", font=F(SERIF_B, 28), fill=INK, anchor="mt")
+    d.text((rx, 268), "賽果頭四", font=F(SERIF_B, 28), fill=INK, anchor="mt")
+    yy = 330
     for i in range(4):
         a = pred[i] if i < len(pred) else "—"
         b = actual[i] if i < len(actual) else "—"
-        d.text((lx, yy), a, font=F(SERIF_B, 92), fill=GOLD if a in hit else INK, anchor="mt")
-        d.text((rx, yy), b, font=F(SERIF_B, 92), fill=GOLD if b in hit else INK, anchor="mt")
-        yy += 220
-
+        d.text((lx, yy), a, font=F(SERIF_B, 88), fill=GOLD if a in hit else INK, anchor="mt")
+        d.text((rx, yy), b, font=F(SERIF_B, 88), fill=GOLD if b in hit else INK, anchor="mt")
+        if i == 1:
+            d.text((W / 2, yy + 40), f"命中 {len(hit)}/4", font=F(SERIF_B, 28), fill=GOLD, anchor="mt")
+        yy += 175
     rows = race.get("payouts") or []
     box_bot = H - M - 26
     box_top = box_bot - 132
@@ -191,7 +170,6 @@ def render_post(race: dict, dest: str = "tx_poster_post"):
         d.text((210, mid), f"命中{row['pool']}", font=F(SERIF_B, 28), fill=GOLD, anchor="mm")
         d.text((540, mid), "$10一注", font=F(SANS_R, 24), fill=MUTE, anchor="mm")
         d.text((860, mid), f"派彩{row['payout']}", font=F(SERIF_B, 30), fill=GREEN, anchor="mm")
-
     OUT.mkdir(parents=True, exist_ok=True)
     png, pdf = OUT / f"{dest}.png", OUT / f"{dest}.pdf"
     im.save(png)
@@ -208,20 +186,16 @@ def render_meeting(meet: dict, dest: str = "tx_poster_day"):
     ornament(d, 124, w)
     d.text((w / 2, 144), meet.get("date_line", ""), font=F(SERIF_B, 36), fill=INK, anchor="mt")
     flourish(d, 204, w)
-
     headers = ["場次", "第一名", "第二名", "第三名", "第四名"]
     races = meet.get("races") or []
-    left, top = 80, 240
-    right, bot = w - 80, h - 80
+    left, top, right, bot = 80, 240, w - 80, h - 80
     cols = 5
     rows_n = 1 + max(len(races), 1)
     cw = (right - left) / cols
     rh = (bot - top) / rows_n
-
     d.rectangle([left, top, right, top + rh], fill=(138, 106, 36))
     for i, hd in enumerate(headers):
         d.text((left + cw * i + cw / 2, top + rh / 2), hd, font=F(SERIF_B, 22), fill=PAPER, anchor="mm")
-
     for r_i, race in enumerate(races):
         y0 = top + rh * (r_i + 1)
         y1 = y0 + rh
@@ -237,16 +211,12 @@ def render_meeting(meet: dict, dest: str = "tx_poster_day"):
             if is_hit:
                 d.rectangle([x + 4, y0 + 6, x + cw - 4, y1 - 6], fill=(245, 230, 190))
             color = GOLD_DEEP if is_hit else INK
-            label = f"{no} {name}"
-            d.text((x + cw / 2, (y0 + y1) / 2), label, font=F(SERIF_B if is_hit else SERIF_R, 20), fill=color, anchor="mm")
+            d.text((x + cw / 2, (y0 + y1) / 2), f"{no} {name}", font=F(SERIF_B if is_hit else SERIF_R, 20), fill=color, anchor="mm")
             if is_hit:
                 d.text((x + cw - 16, y0 + 16), "★", font=F(SERIF_B, 14), fill=GOLD, anchor="mm")
-
     for i in range(cols + 1):
-        x = left + cw * i
-        d.line([(x, top), (x, bot)], fill=LINE, width=1)
+        d.line([(left + cw * i, top), (left + cw * i, bot)], fill=LINE, width=1)
     d.rectangle([left, top, right, bot], outline=GOLD_DEEP, width=2)
-
     OUT.mkdir(parents=True, exist_ok=True)
     png, pdf = OUT / f"{dest}.png", OUT / f"{dest}.pdf"
     im.save(png)
