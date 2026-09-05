@@ -89,11 +89,22 @@ jobs:
         run: |
           git config user.name "capy-bot"
           git config user.email "capy-bot@users.noreply.github.com"
-          git add data/index.json
-          git commit -m "[manifest][skip ci] regenerate data/index.json"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin HEAD:main && exit 0
-            echo "push retry $i"
+          # data/index.json is 100% derived, so a concurrent write is never a
+          # real conflict: on any race we reset to origin/main, REGENERATE from
+          # the fresh tree, and re-commit. Rebasing a generated file只會撞衝突。
+          for i in 1 2 3 4 5; do
+            git add data/index.json
+            git commit -m "[manifest][skip ci] regenerate data/index.json" || true
+            if git push origin HEAD:main; then exit 0; fi
+            echo "push retry $i — refreshing from origin/main"
+            git rebase --abort 2>/dev/null || true
+            git fetch origin main
+            git reset --hard origin/main
+            python3 tools/build_manifest.py
+            if git diff --quiet -- data/index.json; then
+              echo "[manifest] manifest already up to date on origin/main"
+              exit 0
+            fi
             sleep 5
           done
           exit 1
