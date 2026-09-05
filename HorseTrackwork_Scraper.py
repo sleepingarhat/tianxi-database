@@ -13,6 +13,7 @@ Output:
 """
 
 import os, re, time
+import datetime as _dt
 import argparse
 import zlib
 import logging
@@ -128,22 +129,59 @@ if _ARGS.total_shards > 1:
 # Empty CSVs (header-only, ~50 bytes) indicate a failed prior scrape.
 # Treating them as "done" caused 1969/1979 horses to never re-scrape.
 # Re-queue them by only marking CSVs with actual data rows as done.
-def _csv_has_data(path):
+#
+# FRESHNESS (fixed 2026-09-05): "has data rows" alone made every previously
+# scraped horse permanently "done", so the daily Pool A run never refreshed
+# an existing CSV. Trackwork therefore froze at the last full pass
+# (D1 max trackwork_date stuck at 2026-07-15 → 52-day lag) even though the
+# workflow reported success every morning. A CSV now only counts as done when
+# its newest session is within TRACKWORK_REFRESH_DAYS; stale ones are
+# re-queued and then still pass through the lifecycle filter, so retired /
+# inactive horses are not re-fetched.
+REFRESH_DAYS = int(os.environ.get("TRACKWORK_REFRESH_DAYS", "3"))
+_TODAY = _dt.date.today()
+_DATE_CELL_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
+
+
+def _csv_latest_date(path):
+    """Newest dd/mm/yyyy date inside a trackwork CSV, or None when empty."""
+    latest = None
     try:
         with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
-            header = fh.readline()
-            first_row = fh.readline().strip()
-            return bool(first_row)
+            fh.readline()  # header
+            for line in fh:
+                m = _DATE_CELL_RE.search(line)
+                if not m:
+                    continue
+                try:
+                    d = _dt.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+                except ValueError:
+                    continue
+                if latest is None or d > latest:
+                    latest = d
     except Exception:
-        return False
+        return None
+    return latest
+
 
 done = set()
+stale = 0
+empty = 0
 for f in os.listdir(TRACKWORK_DIR):
     if not f.endswith(".csv"):
         continue
     full = os.path.join(TRACKWORK_DIR, f)
-    if _csv_has_data(full):
-        done.add(f.replace("trackwork_", "").replace(".csv", ""))
+    code = f.replace("trackwork_", "").replace(".csv", "")
+    latest = _csv_latest_date(full)
+    if latest is None:
+        empty += 1          # header-only / unreadable → re-queue
+        continue
+    if (_TODAY - latest).days <= REFRESH_DAYS:
+        done.add(code)
+    else:
+        stale += 1          # has data but outdated → re-queue for refresh
+print(f"Freshness scan: fresh={len(done)} stale={stale} empty={empty} "
+      f"(refresh window {REFRESH_DAYS} days)")
 todo_raw = sorted(horse_nos - done)
 print(f"Already done: {len(done)} | Remaining (pre-filter): {len(todo_raw)}")
 
