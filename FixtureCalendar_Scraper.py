@@ -59,6 +59,42 @@ DAY_IN_CELL_RE = re.compile(r'>\s*(\d{1,2})\s*<|^\s*(\d{1,2})\b', re.DOTALL)
 VENUE_MARKER_RE = re.compile(r'(?:alt="(?:ST|HV|AWT)"|/(?:st-ch|hv-ch|awt)\.(?:gif|png))', re.IGNORECASE)
 
 
+# The calendar header renders the month actually displayed, e.g.
+#   <td colspan="7">二0二六年九月</td>
+# HKJC silently falls back to the CURRENT month when the requested month has no
+# fixtures at all (e.g. the August off-season), which previously injected phantom
+# race days into fixtures.csv. We therefore verify the rendered month before
+# accepting any day from the page.
+HEADER_RE = re.compile(r'<td[^>]*colspan="7"[^>]*>\s*([^<]+?)\s*</td>')
+CN_DIGIT = {"0": 0, "〇": 0, "零": 0, "O": 0, "o": 0,
+            "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+            "六": 6, "七": 7, "八": 8, "九": 9}
+CN_MONTH = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+            "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+
+
+def _cn_year(s: str) -> int | None:
+    out = 0
+    for ch in s.strip():
+        if ch not in CN_DIGIT:
+            return None
+        out = out * 10 + CN_DIGIT[ch]
+    return out if 1900 < out < 2200 else None
+
+
+def rendered_month(html: str) -> tuple[int, int] | None:
+    """Return (year, month) as rendered by the calendar header, or None."""
+    for raw in HEADER_RE.findall(html):
+        m = re.match(r"(.+?)年(.+?)月", raw)
+        if not m:
+            continue
+        y = _cn_year(m.group(1))
+        mo = CN_MONTH.get(m.group(2).strip())
+        if y and mo:
+            return y, mo
+    return None
+
+
 def fetch_month(client: httpx.Client, year: int, month: int) -> List[int]:
     """Return list of race-day day-of-month integers for the given (year, month).
 
@@ -69,6 +105,18 @@ def fetch_month(client: httpx.Client, year: int, month: int) -> List[int]:
     url = f"{FIXTURE_URL}?CalYear={year}&CalMonth={month:02d}"
     r = client.get(url, timeout=20.0)
     r.raise_for_status()
+
+    shown = rendered_month(r.text)
+    if shown is None:
+        print(f"[fixture] {year}-{month:02d} WARN: cannot read calendar header — skipping month",
+              file=sys.stderr)
+        return []
+    if shown != (year, month):
+        # Off-season / unavailable month: HKJC served a different month instead.
+        print(f"[fixture] {year}-{month:02d} no fixtures (page showed "
+              f"{shown[0]}-{shown[1]:02d}) — skipping month", file=sys.stderr)
+        return []
+
     days = []
     for cell_html in CALENDAR_CELL_RE.findall(r.text):
         # Require a venue marker to qualify as race day
