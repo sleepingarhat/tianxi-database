@@ -190,8 +190,99 @@ if not todo:
 
 TRACKWORK_COLS = [
     "horse_no", "date", "work_type",
-    "racecourse", "track", "workout_details", "gear"
+    "racecourse", "track", "venue",
+    "distance", "time", "time_sec", "splits",
+    "partner", "rider", "placing",
+    "comment", "gear", "workout_details",
 ]
+
+# ── 操練詳情解析 ────────────────────────────────────────────────────────────
+# HKJC 把場地／距離／分段時間／合操馬／騎手全部塞入「操練詳情」一欄，形式有四種：
+#   快操   "29.6 25.0 (54.6) (助手)"                    → 分段 + 總時間 + 騎手
+#   試閘   "第2組 (徐君禮) 1200M 皮具伯樂 24.2 22.3 (1.10.52)" → 組別/騎師/距離/合操馬/時間
+#   出賽   "1650M (潘頓) (5/14)"                        → 距離 + 騎師 + 名次
+#   踱步   "內圈 快踱一圈 (助手)"                        → 跑道 + 內容 + 助手
+# 以下把佢們拆成獨立欄位，令下游 ingest 唔再只剩日期。
+_PAREN_RE   = re.compile(r"[\(（]([^\)）]*)[\)）]")
+_DIST_RE    = re.compile(r"(\d{3,4})\s*[Mm]")
+_GROUP_RE   = re.compile(r"第\s*(\d+)\s*組")
+_PLACING_RE = re.compile(r"^\d+\s*/\s*\d+$")
+_TIME_RE    = re.compile(r"^\d+(?:[.:]\d+){1,2}$")
+_SPLIT_RE   = re.compile(r"(?<![\d.])(\d{1,2}\.\d)(?![\d])")
+
+
+def _time_to_sec(t):
+    """'54.6' → 54.6 ; '1.10.52' / '1:10.52' → 70.52"""
+    if not t:
+        return None
+    parts = re.split(r"[.:]", t.strip())
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 60 + int(parts[1]) + float("0." + parts[2])
+        if len(parts) == 2:
+            return float(f"{parts[0]}.{parts[1]}")
+        return float(t)
+    except Exception:
+        return None
+
+
+def parse_workout_details(work_type, track, details):
+    """把操練詳情拆成 距離／時間／分段／合操馬／騎手／名次／備註。"""
+    out = {
+        "distance": "", "time": "", "time_sec": "", "splits": "",
+        "partner": "", "rider": "", "placing": "", "comment": "",
+    }
+    text = (details or "").strip()
+    if not text:
+        return out
+
+    parens = [p.strip() for p in _PAREN_RE.findall(text) if p.strip()]
+    rest = _PAREN_RE.sub(" ", text)
+
+    for p in parens:
+        if _PLACING_RE.match(p):
+            out["placing"] = p.replace(" ", "")
+        elif _TIME_RE.match(p):
+            out["time"] = p
+        elif not out["rider"]:
+            out["rider"] = p
+
+    m = _DIST_RE.search(rest)
+    if m:
+        out["distance"] = f"{m.group(1)}M"
+        rest = rest.replace(m.group(0), " ")
+
+    splits = _SPLIT_RE.findall(rest)
+    if splits:
+        out["splits"] = " ".join(splits)
+        for sp in splits:
+            rest = rest.replace(sp, " ", 1)
+    if not out["time"] and splits:
+        # 冇括號總時間時，用分段之和作參考（例如只得單段快操）
+        total = sum(float(x) for x in splits)
+        out["time"] = f"{total:.1f}" if len(splits) > 1 else splits[0]
+
+    out["time_sec"] = _time_to_sec(out["time"]) or ""
+
+    gm = _GROUP_RE.search(rest)
+    if gm:
+        rest = rest.replace(gm.group(0), " ")
+
+    # 清走跑道前綴（"內圈 快踱一圈" → "快踱一圈"）
+    leftover = " ".join(rest.split())
+    if track and leftover.startswith(track):
+        leftover = leftover[len(track):].strip()
+    leftover = leftover.strip(" -－·").strip()
+
+    if work_type in ("試閘", "出賽") and leftover:
+        # 試閘／出賽：剩落嘅中文名就係合操馬
+        out["partner"] = leftover
+    else:
+        out["comment"] = leftover
+    if gm:
+        grp = f"第{gm.group(1)}組"
+        out["comment"] = (grp + " " + out["comment"]).strip()
+    return out
 
 SESSION = requests.Session()
 SESSION.headers.update(TRACKWORK_HEADERS)
@@ -268,14 +359,25 @@ for i, horse_no in enumerate(todo, 1):
             if workout_det == v: workout_det = ""
             if gear == v: gear = ""
 
+        parsed = parse_workout_details(work_type, track, workout_det)
         records.append({
             "horse_no":        horse_no,
             "date":            date_val,
             "work_type":       work_type,
             "racecourse":      racecourse,
             "track":           track,
-            "workout_details": workout_det,
+            # venue 供下游 ingest 直接用：場地 + 跑道
+            "venue":           (racecourse + (" " + track if track else "")).strip(),
+            "distance":        parsed["distance"],
+            "time":            parsed["time"],
+            "time_sec":        parsed["time_sec"],
+            "splits":          parsed["splits"],
+            "partner":         parsed["partner"],
+            "rider":           parsed["rider"],
+            "placing":         parsed["placing"],
+            "comment":         parsed["comment"] or work_type,
             "gear":            gear,
+            "workout_details": workout_det,
         })
 
     if records:
