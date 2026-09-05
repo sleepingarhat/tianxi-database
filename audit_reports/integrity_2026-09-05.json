@@ -1,66 +1,28 @@
 {
   "scan_date": "2026-09-05",
   "repo_root": "/home/runner/work/tianxi-database/tianxi-database",
-  "overall_severity": "critical",
-  "critical_gap_count": 35,
+  "overall_severity": "warn",
+  "critical_gap_count": 0,
   "warn_gap_count": 6,
-  "recommendation": "gha_next_delta_will_fix",
+  "recommendation": "monitor_no_block",
   "categories": {
     "race_artefacts": {
       "name": "race_artefacts",
-      "expected": 750,
+      "expected": 715,
       "present": 715,
-      "missing": [
-        "results_2026-08-06",
-        "commentary_2026-08-06",
-        "dividends_2026-08-06",
-        "sectional_times_2026-08-06",
-        "video_links_2026-08-06",
-        "results_2026-08-09",
-        "commentary_2026-08-09",
-        "dividends_2026-08-09",
-        "sectional_times_2026-08-09",
-        "video_links_2026-08-09",
-        "results_2026-08-13",
-        "commentary_2026-08-13",
-        "dividends_2026-08-13",
-        "sectional_times_2026-08-13",
-        "video_links_2026-08-13",
-        "results_2026-08-16",
-        "commentary_2026-08-16",
-        "dividends_2026-08-16",
-        "sectional_times_2026-08-16",
-        "video_links_2026-08-16",
-        "results_2026-08-20",
-        "commentary_2026-08-20",
-        "dividends_2026-08-20",
-        "sectional_times_2026-08-20",
-        "video_links_2026-08-20",
-        "results_2026-08-23",
-        "commentary_2026-08-23",
-        "dividends_2026-08-23",
-        "sectional_times_2026-08-23",
-        "video_links_2026-08-23",
-        "results_2026-08-27",
-        "commentary_2026-08-27",
-        "dividends_2026-08-27",
-        "sectional_times_2026-08-27",
-        "video_links_2026-08-27"
-      ],
+      "missing": [],
       "stale": [],
-      "notes": [
-        "days with any missing artefact: 7"
-      ],
-      "severity": "critical"
+      "notes": [],
+      "severity": "ok"
     },
     "fixtures_cache": {
       "name": "fixtures_cache",
       "expected": 1,
-      "present": 238,
+      "present": 231,
       "missing": [],
       "stale": [],
       "notes": [
-        "total cached race days: 238"
+        "total cached race days: 231"
       ],
       "severity": "ok"
     },
