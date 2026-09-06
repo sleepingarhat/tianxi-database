@@ -1,7 +1,1 @@
-﻿horse_no,date,work_type,racecourse,track,workout_details,gear
-L924,26/04/2026,出賽,沙田,草地,2000M (莫雷拉) (8/8),H/SR
-L924,25/04/2026,踱步,沙田,外圈,外圈 快踱兩圈 (莫雷拉),H/SR
-L924,24/04/2026,踱步,沙田,外圈,外圈 快踱兩圈 (莫雷拉),H/SR
-L924,22/04/2026,快操,沙田,草地,29.4 25.7 23.3 (1.18.4) (莫雷拉),H/SR
-L924,21/04/2026,踱步,沙田,外圈,外圈 快踱兩圈 (助手),H/SR
-L924,20/04/2026,踱步,沙田,外圈,外圈 快踱兩圈 (助手),H/SR
+﻿horse_no,date,work_type,racecourse,track,venue,distance,time,time_sec,splits,partner,rider,placing,comment,gear,workout_details
