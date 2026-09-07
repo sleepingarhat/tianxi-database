@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+K586,002,05,06/09/26,沙田,草地,A,1000,好,4,9,53,蘇偉賢,奧爾民,5,7.1,130,1 2 5,0.57.38,1137,B1/TT
 K586,835,10,04/07/26,沙田,草地,C+3,1200,好/黏,4,2,56,蘇偉賢,奧爾民,5-1/4,8.1,132,4 6 10,1.10.41,1122,TT
 K586,780,08,13/06/26,沙田,草地,C+3,1200,好/黏,4,11,58,蘇偉賢,奧爾民,6-1/2,12,134,12 11 8,1.10.48,1125,TT
 K586,695,04,17/05/26,沙田,草地,C+3,1000,好/黏,4,4,59,蘇偉賢,奧爾民,4-1/2,14,134,4 5 4,0.57.13,1140,TT
