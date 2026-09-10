@@ -115,11 +115,30 @@ jobs:
       - name: Run race day scraper
         if: steps.guard.outputs.no_race != 'true'
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            python RacingData_Scraper.py --date "${{ github.event.inputs.date }}"
-          else
-            python RacingData_Scraper.py --daily
-          fi
+          # 2026-09-10: Chrome/ChromeDriver read-timeouts (selenium ReadTimeoutError)
+          # silently dropped a whole race day (2026-09-09). Retry up to 3 times
+          # with a cool-down so a transient browser hang no longer loses results.
+          run_scraper() {
+            if [ -n "${{ github.event.inputs.date }}" ]; then
+              python RacingData_Scraper.py --date "${{ github.event.inputs.date }}"
+            else
+              python RacingData_Scraper.py --daily
+            fi
+          }
+          for attempt in 1 2 3; do
+            echo "::group::race-day scraper attempt $attempt"
+            if run_scraper; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::scraper attempt $attempt failed"
+            pkill -f chromedriver || true
+            pkill -f "chrome" || true
+            sleep 30
+          done
+          echo "::error::race-day scraper failed after 3 attempts"
+          exit 1
 
       - name: Push results to main
         if: steps.guard.outputs.no_race != 'true'
