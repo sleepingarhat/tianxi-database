@@ -1,0 +1,122 @@
+name: Capy Pedigree — 馬匹血統 (含新馬自動補抓)
+
+# HorsePedigree_Scraper.py keeps data/pedigree/horse_pedigree.csv complete for
+# every horse the engine may score — first-starters (新馬) included, since they
+# have no form records and pedigree is the only prior signal available.
+#
+# Schedule:
+#   * HK 21:30 Mon/Tue/Sat (after the entries scraper at HK 20:00) — fast
+#     entry-list-only pass so tomorrow's new horses always have pedigree.
+#   * HK 05:00 Wed — full sweep (capped) to backfill the rest of the pool.
+# After committing the CSV, the pedigree map is pushed to Cloudflare D1
+# (horse_pedigree + horses.sire/dam/dam_sire backfill).
+
+on:
+  schedule:
+    - cron: '30 13 * * 1,2,6'   # HK 21:30 Mon/Tue/Sat — entry-list pass
+    - cron: '0 21 * * 2'        # HK 05:00 Wed — full sweep
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'entries | full | refresh-all'
+        required: false
+        default: 'full'
+      limit:
+        description: 'Max horses to scrape this run (0 = no cap)'
+        required: false
+        default: '0'
+      push_d1:
+        description: 'Push pedigree map to D1 (true/false)'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: capy-pedigree
+  cancel-in-progress: false
+
+jobs:
+  pedigree:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Resolve mode
+        id: mode
+        run: |
+          set -eu
+          MODE="${{ github.event.inputs.mode }}"
+          LIMIT="${{ github.event.inputs.limit }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "30 13 * * 1,2,6" ]; then
+              MODE=entries; LIMIT=0
+            else
+              MODE=full; LIMIT=600
+            fi
+          fi
+          echo "mode=${MODE:-full}" >> "$GITHUB_OUTPUT"
+          echo "limit=${LIMIT:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Run pedigree scraper
+        env:
+          PEDIGREE_SLEEP: '0.7'
+        run: |
+          set -eu
+          ARGS="--limit ${{ steps.mode.outputs.limit }}"
+          case "${{ steps.mode.outputs.mode }}" in
+            entries)     ARGS="$ARGS --entries-only" ;;
+            refresh-all) ARGS="$ARGS --refresh-all" ;;
+          esac
+          echo "python HorsePedigree_Scraper.py $ARGS"
+          python HorsePedigree_Scraper.py $ARGS
+
+      - name: Coverage summary
+        run: |
+          python - <<'PY'
+          import csv
+          rows = list(csv.DictReader(open('data/pedigree/horse_pedigree.csv', encoding='utf-8-sig')))
+          sire = sum(1 for r in rows if (r.get('sire') or '').strip())
+          dams = sum(1 for r in rows if (r.get('dam_sire') or '').strip())
+          print(f"pedigree rows={len(rows)} sire={sire} dam_sire={dams}")
+          PY
+
+      - name: Push pedigree CSV to main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python git_sync.py \
+            --message "[data][skip ci] pedigree $(date -u +%Y-%m-%dT%H:%MZ) via GHA"
+
+      - name: Install wrangler
+        if: github.event.inputs.push_d1 != 'false'
+        run: npm install -g wrangler@4
+
+      - name: Push pedigree map to D1
+        if: github.event.inputs.push_d1 != 'false'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -eu
+          rm -rf /tmp/pedigree-sql
+          python scripts/pedigree_to_d1_sql.py --out /tmp/pedigree-sql --chunk 400
+          for f in $(ls /tmp/pedigree-sql/*.sql | sort); do
+            echo "--> $f"
+            wrangler d1 execute tianxi-db --remote --file="$f" --yes
+          done
