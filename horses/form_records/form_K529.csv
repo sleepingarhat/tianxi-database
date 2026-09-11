@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+K529,016,01,09/09/26,跑馬地,草地,A,1000,好,4,3,52,方嘉柏,何澤堯,3/4,5.4,130,9 7 1,0.57.62,1206,TT
 K529,840,01,08/07/26,跑馬地,草地,B,1000,好,4,8,46,方嘉柏,莫雷拉,1/2,2.8,120,10 8 1,0.56.81,1187,TT
 K529,768,06,10/06/26,跑馬地,草地,C+3,1000,好,4,9,47,方嘉柏,莫雷拉,2,3,124,10 10 6,0.57.10,1184,TT
 K529,735,04,31/05/26,沙田,草地,B,1000,好,4,11,48,方嘉柏,莫雷拉,1-1/4,6.8,123,3 2 4,0.56.34,1179,TT
