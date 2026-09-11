@@ -11,6 +11,7 @@
 [![Sanity](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_sanity_daily.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_sanity_daily.yml)
 [![Integrity](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_integrity_audit.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_integrity_audit.yml)
 [![D1 Sync](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_d1_sync.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_d1_sync.yml)
+[![Pedigree](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_pedigree.yml/badge.svg)](https://github.com/sleepingarhat/tianxi-database/actions/workflows/capy_pedigree.yml)
 
 ---
 
@@ -42,7 +43,7 @@ Production URLs：
 | 練馬師 Profile | **67 位**（active roster） |
 | 騎師 Profile | **~100 位**（含 apprentice + freelance） |
 | Fixture 日曆 cache | **152 race days** (2025-2026) |
-| GHA workflow 檔 | **19 個**（每日 cron + D1 sync + 部署 + TG 通知 + ELO Post-Race） |
+| GHA workflow 檔 | **20 個**（每日 cron + D1 sync + 部署 + TG 通知 + ELO Post-Race） |
 | 結構化數據總 size | ~90 MB CSV（`utf-8-sig`） |
 
 **消費模式：** 前端/ML/BI 直接 fetch GitHub raw CSV。零 server、零 DB 運維。
@@ -54,7 +55,7 @@ Production URLs：
 香港賽馬會（HKJC）官方只出 SPA + PDF，冇公開 structured API。
 天喜把 HKJC 11 年公開賽果抽象化成穩定 CSV schema，每日自動刷新，為下游 AI 產品（Elo / 選馬模型 / 賠率分析 / BI）提供可信數據層。
 
-- **全自動** — GitHub Actions cron，19 個 workflow 協同跑
+- **全自動** — GitHub Actions cron，20 個 workflow 協同跑
 - **賽日感知** — `fixture_guard` 非賽日自動跳過，每月慳 ~60% GHA minutes
 - **自愈** — 每日 sanity dashboard + integrity audit，遺漏自動開 Issue
 - **Idempotent** — 已存在檔案 skip，安全重跑
@@ -100,7 +101,8 @@ Production URLs：
 │  data/20{16..26}/    horses/profiles/    trainers/          │
 │  data/fixtures/      horses/form_records/ jockeys/          │
 │  entries/            horses/trackwork/    trials/           │
-│  reports/            horses/injury/       audit_reports/    │
+│  reports/            horses/injury/       horses/pedigree/  │
+│                      audit_reports/                        │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -267,6 +269,28 @@ Backfill / developer tooling，**不參與 daily cron**。跑佢會序貫執行�
 
 ---
 
+### 11. `HorsePedigree_Scraper.py` — 馬匹血統（含新馬自動補抓）
+
+**爬乜：**
+- `horses/pedigree/horse_pedigree.csv` — 父系（sire）、母系（dam）、外祖父（dam_sire）等血統欄位
+- 專門回填由 CSV → D1 同步過程中遺漏嘅血統資料，令新馬即使無往績都能有血統特徵可用
+
+**點運作：**
+- 自動從三個來源收集馬匹 code：
+  1. 今日／近期排位表（`entries/`）— 優先抓新馬
+  2. 現有 `horse_profiles.csv` — 種入已經有 profile 但血統未同步嘅馬
+  3. 歷年賽果（`data/20*/results_*.csv`）— 全池補漏
+- 只抓血統欄位不完整嘅馬，避免重複請求
+- 純 `requests` + HKJC 共用解析器，唔需要 Selenium，輕量可跑喺 GitHub Actions
+- 輸出 CSV 後由 `scripts/pedigree_to_d1_sql.py` 生成 upsert SQL，回填 D1 `horse_pedigree` 表同 `horses.sire/dam/dam_sire`
+
+**Trigger：**
+- `capy_pedigree.yml` — 香港時間逢一、二、六 21:30 跑「排位表模式」（只抓新 entry 馬）；逢三 05:00 跑「全池補抓模式」（上限 600 匹）。workflow_dispatch 支援 `mode`、`limit`、`refresh-all`。
+
+**現狀：** 已種入 6,068 匹血統，父系 / 母系 / 外祖父全部有值；生產 D1 `horses.sire` 由原本 16 匹提升至 6,068 匹。
+
+---
+
 ## D1 自動同步 · capy_d1_sync（NEW 2026-04-30）
 
 兩條 workflow 負責將 tianxi-database 嘅 CSV 自動推上 Cloudflare D1（`tianxi-db`）：
@@ -295,6 +319,7 @@ Backfill / developer tooling，**不參與 daily cron**。跑佢會序貫執行�
 | ELO Post-Race | 賽後即跑（race_daily 完成觸發） | 過去 2 日有賽 | ELO v12 增量更新（落 D1）|
 | Sanity Daily | 10:03 | 冇 | 生成 SANITY.md |
 | Integrity Audit | 11:00 | 冇 | 10-cat 缺漏審計 |
+| Pedigree | 一/二/六 21:30 + 三 05:00 | 冇（輕量） | 新馬血統自動補抓 + 全池回填 |
 
 ---
 
@@ -315,7 +340,8 @@ horses/
 ├── profiles/horse_profiles.csv     # 馬匹 profile（動態列）
 ├── form_records/form_XXXX.csv      # 每匹馬完整出賽紀錄（21-col）
 ├── trackwork/trackwork_XXXX.csv    # 晨操
-└── injury/injury_<brand>.csv       # 獸醫紀錄
+├── injury/injury_<brand>.csv       # 獸醫紀錄
+└── pedigree/horse_pedigree.csv     # 父系 / 母系 / 外祖父（6,068 匹覆蓋）
 trainers/
 ├── trainer_profiles.csv            # 67 位
 └── records/trainer_CODE.csv        # 往績
@@ -474,7 +500,7 @@ HKJC 原始賽果為公開資訊，本 repo 只做 **結構化重組** 同 **sch
 - 系統規劃：[plan.md](./plan.md)
 - Data schema 詳情：[DATA_NOTES.md](./DATA_NOTES.md)
 
-*Maintained by Capy / GitHub Actions · 19 個 workflow 24/7 自主運行 · 每日自動數據完整性審計。*
+*Maintained by Capy / GitHub Actions · 20 個 workflow 24/7 自主運行 · 每日自動數據完整性審計。*
 
 
   ## 已知問題修復記錄
