@@ -5,6 +5,7 @@ Pool A (horse-heavy, sequential — they share the horses/ workspace):
   1. HorseData_Scraper.py       — 馬匹 Profile + 血統 + 往績紀錄
   2. HorseTrackwork_Scraper.py  — 晨操資料
   3. HorseInjury_Scraper.py     — 傷患紀錄
+  4. HorsePedigree_Scraper.py   — 血統 (含新馬自動補抓)
 
 Pool B (light, sequential — fully independent of Pool A):
   1. TrialResults_Scraper.py    — 試閘結果
@@ -25,6 +26,7 @@ POOLS = {
         ("馬匹 Profile + 血統 + 往績", "HorseData_Scraper.py"),
         ("晨操資料", "HorseTrackwork_Scraper.py"),
         ("傷患紀錄", "HorseInjury_Scraper.py"),
+        ("血統 (含新馬自動補抓)", "HorsePedigree_Scraper.py"),
     ],
     "B": [
         ("試閘結果", "TrialResults_Scraper.py"),
