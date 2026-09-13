@@ -1,0 +1,122 @@
+name: Automation Watchdog — ingestion freshness alarm
+
+# Why this exists: on 2026-09-10 a broken pipeline went unnoticed for four days
+# and the site silently fell back to baseline ratings. This watchdog fails
+# loudly and opens/updates a GitHub issue whenever a critical ingestion
+# workflow has had no successful run inside its freshness window.
+# Fail-open on network/API errors only; never fail-open on a bad signal.
+
+on:
+  schedule:
+    - cron: '25 5 * * *'
+    - cron: '25 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check ingestion freshness
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          GH = os.environ['GH_TOKEN']; REPO = os.environ['REPO']
+          HKT = timezone(timedelta(hours=8))
+          now = datetime.now(timezone.utc)
+          problems, notes = [], []
+
+          # workflow file -> max hours since the last successful run.
+          # Daily jobs: 30h. Race-day-only jobs: 96h. Weekly jobs: 200h.
+          CRITICAL = {
+              'capy_odds.yml': 30,
+              'capy_pool_a.yml': 30,
+              'capy_pool_b_daily.yml': 30,
+              'capy_sanity_daily.yml': 30,
+              'capy_entries.yml': 96,
+              'capy_race_daily.yml': 96,
+              'capy_d1_sync.yml': 96,
+              'capy_d1_sync_entries.yml': 96,
+              'capy_d1_sync_pool_a.yml': 96,
+              'elo-post-race.yml': 96,
+              'capy_fixture_weekly.yml': 200,
+              'capy_integrity_audit.yml': 200,
+          }
+
+          def api(method, path, body=None):
+              req = urllib.request.Request(
+                  f'https://api.github.com/repos/{REPO}{path}',
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={
+                      'Authorization': f'Bearer {GH}',
+                      'Accept': 'application/vnd.github+json',
+                      'Content-Type': 'application/json',
+                      'User-Agent': 'tianxi-watchdog/1.0',
+                  },
+                  method=method,
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read().decode() or 'null')
+
+          for wf, max_age in CRITICAL.items():
+              try:
+                  data = api('GET', f'/actions/workflows/{wf}/runs?per_page=10')
+              except Exception as e:
+                  notes.append(f'{wf}: 查詢失敗（fail-open）：{e}')
+                  continue
+              runs = [r for r in data.get('workflow_runs', []) if r.get('status') == 'completed']
+              if not runs:
+                  notes.append(f'{wf}: 未有已完成紀錄')
+                  continue
+              ok = [r for r in runs if r.get('conclusion') == 'success']
+              if not ok:
+                  problems.append(f"{wf}: 最近 {len(runs)} 次全部失敗，最新 {runs[0]['html_url']}")
+                  continue
+              age = (now - datetime.fromisoformat(ok[0]['updated_at'].replace('Z', '+00:00'))).total_seconds() / 3600
+              if age > max_age:
+                  problems.append(
+                      f'{wf}: 最近一次成功已過 {age:.1f} 小時（上限 {max_age}）'
+                      f" 最新一次 {runs[0].get('conclusion')} {runs[0]['html_url']}"
+                  )
+              else:
+                  notes.append(f'{wf}: 最近成功 {age:.1f} 小時前')
+
+          report = '\n'.join(
+              ['## 資料採集監測'] + [f'- {p}' for p in problems]
+              + (['', '### 備註'] + [f'- {n}' for n in notes] if notes else [])
+          )
+          print(report)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(report + '\n')
+
+          TITLE = '[watchdog] 資料採集管線異常'
+          try:
+              open_issues = api('GET', '/issues?state=open&per_page=100') or []
+              existing = next((i for i in open_issues if i.get('title') == TITLE), None)
+              stamp = datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')
+              if problems:
+                  body = f'偵測時間：{stamp}\n\n{report}'
+                  if existing:
+                      api('POST', f"/issues/{existing['number']}/comments", {'body': body})
+                  else:
+                      api('POST', '/issues', {'title': TITLE, 'body': body})
+              elif existing:
+                  api('POST', f"/issues/{existing['number']}/comments",
+                      {'body': f'{stamp}：全部檢查通過，自動關閉。\n\n{report}'})
+                  api('PATCH', f"/issues/{existing['number']}", {'state': 'closed'})
+          except Exception as e:
+              print('issue update failed (non-fatal):', e)
+
+          if problems:
+              raise SystemExit(1)
+          PY
