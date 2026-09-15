@@ -94,7 +94,7 @@ jobs:
             echo "|---|---|---|"
           } >> "$OUT"
 
-          for CSV in data/fixtures/fixtures.csv data/pool_a_horses.csv trainers/trainer_profiles.csv; do
+          for CSV in data/fixtures/fixtures.csv horses/profiles/horse_profiles.csv trainers/trainer_profiles.csv; do
             if [ -f "$CSV" ]; then
               LAST=$(git log -1 --format='%ai' -- "$CSV" 2>/dev/null || echo "—")
               ROWS=$(wc -l < "$CSV" 2>/dev/null || echo "?")
