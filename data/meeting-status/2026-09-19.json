@@ -1,0 +1,11 @@
+{
+  "date": "2026-09-19",
+  "status": "cancelled",
+  "reason_zh_hk": "因董建華離世，今日賽事停賽",
+  "prediction_policy": {
+    "generate": false,
+    "lock": false,
+    "include_in_record": false
+  },
+  "recorded_at": "2026-09-19T06:00:00Z"
+}
