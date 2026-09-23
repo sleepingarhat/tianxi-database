@@ -362,30 +362,49 @@ def scrape_one_date(driver, single_date):
     commentary_file = os.path.join(year_folder, f"commentary_{formatted_date}.csv")
     video_file      = os.path.join(year_folder, f"video_links_{formatted_date}.csv")
 
-    def _csv_row_count(path):
-        try:
-            with open(path, "r", encoding="utf-8-sig") as fh:
-                return sum(1 for _ in fh)
-        except Exception:
-            return 0
-
     # Fix (2026-05-13): partial scrapes (e.g. R1 only when R2-R9 not yet posted)
     # left tiny CSVs that caused all subsequent runs to skip the date forever.
     # HKJC meetings always have 8-11 races x 10-14 horses = 80-150 rows + header,
     # so a results file with <30 rows is a partial scrape that must be retried.
-    def _csv_race_nos(path):
+    # Fix (2026-09-24 v2): skip decision is a race-number SET comparison, never a
+    # row count or link count (HKJC's page always yields 14 probe links vs 8-11
+    # real races). A race counts as "have" only if at least one row carries a
+    # numeric finishing place.
+    def _csv_placed_race_nos(path):
         try:
-            df = pd.read_csv(path, encoding="utf-8-sig", usecols=["race_no"])
-            return set(int(x) for x in df["race_no"].dropna())
+            df = pd.read_csv(path, encoding="utf-8-sig", usecols=["race_no", "place"], dtype=str)
         except Exception:
             return set()
+        out = set()
+        for rn, pl in zip(df["race_no"], df["place"]):
+            try:
+                rn_i = int(float(rn))
+            except Exception:
+                continue
+            if re.match(r"^\s*\d+", str(pl or "")):
+                out.add(rn_i)
+        return out
+
+    def _probe_is_real_race(rn, known):
+        """True if HKJC renders a genuine race rn (not a silent R1 fallback)."""
+        url = f"{BASE_URL}?RaceDate={meet_date}&RaceNo={rn}"
+        if not load_page(driver, url):
+            return None  # unknown
+        tabs = driver.find_elements(By.CLASS_NAME, "race_tab")
+        if not tabs:
+            return False
+        try:
+            got = int(str(parse_race_header(tabs[0]).get("race_no") or "").strip())
+        except Exception:
+            return False
+        return got == rn and got not in known
 
     files_exist = all(os.path.exists(f) for f in [results_file, dividends_file, sectional_file, commentary_file, video_file])
 
     main_url = f"{BASE_URL}?RaceDate={meet_date}"
     if not load_page(driver, main_url):
         log_failed(formatted_date, "page load failed")
-        return "skip" if files_exist and _csv_row_count(results_file) >= 30 else "fail"
+        return "fail"  # cannot confirm HKJC race set -> retry next run, never skip blind
 
     if not driver.find_elements(By.CLASS_NAME, "race_tab"):
         return "norace"
@@ -396,14 +415,20 @@ def scrape_one_date(driver, single_date):
     venue     = ""
     race_urls = get_race_urls(driver, meet_date)
 
-    # Fix (2026-09-24): a mid-meeting run (e.g. R1-R4 = 49 rows) passed the old
-    # ">=30 rows" skip test, so later runs skipped the date and R5-R9 were never
-    # collected. Skip only when the CSV already holds every race HKJC lists.
+    # Skip iff set(CSV placed race_no) == set(HKJC actual race numbers).
+    # HKJC numbers races contiguously 1..N, so the actual set is confirmed by
+    # (a) the CSV holding exactly 1..max with placings, and (b) HKJC NOT
+    # rendering a genuine race max+1. One extra page load, no link counting.
     if files_exist:
-        have = _csv_race_nos(results_file)
-        if have and len(have) >= len(race_urls):
-            return "skip"
-        print(f"[skip-check] {formatted_date} CSV has races {sorted(have)} but HKJC lists {len(race_urls)} -> re-scraping", flush=True)
+        have = _csv_placed_race_nos(results_file)
+        if have and have == set(range(1, max(have) + 1)):
+            nxt = _probe_is_real_race(max(have) + 1, have)
+            if nxt is False:
+                print(f"[skip-check] {formatted_date} complete: races {sorted(have)} == HKJC set -> skip", flush=True)
+                return "skip"
+            print(f"[skip-check] {formatted_date} CSV races {sorted(have)}; HKJC R{max(have)+1} probe={nxt} -> re-scraping", flush=True)
+        else:
+            print(f"[skip-check] {formatted_date} CSV placed races {sorted(have)} not contiguous/complete -> re-scraping", flush=True)
 
     all_results, all_dividends, all_sectional, all_commentary, all_videos = [], [], [], [], []
 
