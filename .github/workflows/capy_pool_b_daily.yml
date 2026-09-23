@@ -71,16 +71,13 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-
-      - name: Setup ChromeDriver
-        if: steps.guard.outputs.run == 'true'
-        uses: nanasess/setup-chromedriver@v2
+          install-chromedriver: true
 
       - name: Export browser paths
         if: steps.guard.outputs.run == 'true'
         run: |
           echo "CHROMIUM_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-          echo "CHROMEDRIVER_PATH=$(which chromedriver)" >> $GITHUB_ENV
+          echo "CHROMEDRIVER_PATH=${{ steps.chrome.outputs.chromedriver-path }}" >> $GITHUB_ENV
 
       - name: Install Python deps
         if: steps.guard.outputs.run == 'true'
