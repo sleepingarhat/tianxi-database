@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-09-23T09:18:33+00:00",
+  "generated_at": "2026-09-23T15:51:00+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "3837d5e3c539e5e309c3e87ffdd7f089f4aa484a",
+  "git_head": "eb5c9632b06e63d774d4d121ff8a643549ccaad5",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -15,8 +15,8 @@
     "readme": "README.md"
   },
   "summary": {
-    "race_days": 941,
-    "race_artefact_files": 4699,
+    "race_days": 942,
+    "race_artefact_files": 4704,
     "fixtures_rows": 231,
     "horse_form_files": 6074,
     "horse_profile_rows": 6074,
@@ -49,16 +49,16 @@
       "path_template": "data/{year}/{kind}_{date}.csv",
       "raw_url_template": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/data/{year}/{kind}_{date}.csv",
       "count_by_kind": {
-        "results": 935,
-        "commentary": 941,
-        "dividends": 941,
-        "sectional": 941,
-        "video": 941
+        "results": 936,
+        "commentary": 942,
+        "dividends": 942,
+        "sectional": 942,
+        "video": 942
       },
-      "distinct_race_days": 941,
+      "distinct_race_days": 942,
       "date_range": {
         "start": "2016-01-01",
-        "end": "2026-09-16"
+        "end": "2026-09-23"
       },
       "season_years": [
         2016,
@@ -74,7 +74,7 @@
         2026
       ],
       "example": {
-        "results": "data/2026/results_2026-09-16.csv"
+        "results": "data/2026/results_2026-09-23.csv"
       }
     },
     "fixtures": {
