@@ -108,13 +108,12 @@ jobs:
         id: chrome
         with:
           chrome-version: stable
-
-      - uses: nanasess/setup-chromedriver@v2
+          install-chromedriver: true
 
       - name: Export browser paths
         run: |
           echo "CHROMIUM_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-          echo "CHROMEDRIVER_PATH=$(which chromedriver)" >> $GITHUB_ENV
+          echo "CHROMEDRIVER_PATH=${{ steps.chrome.outputs.chromedriver-path }}" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
@@ -170,13 +169,12 @@ jobs:
         id: chrome
         with:
           chrome-version: stable
-
-      - uses: nanasess/setup-chromedriver@v2
+          install-chromedriver: true
 
       - name: Export browser paths
         run: |
           echo "CHROMIUM_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-          echo "CHROMEDRIVER_PATH=$(which chromedriver)" >> $GITHUB_ENV
+          echo "CHROMEDRIVER_PATH=${{ steps.chrome.outputs.chromedriver-path }}" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
