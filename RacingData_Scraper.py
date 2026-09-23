@@ -373,15 +373,19 @@ def scrape_one_date(driver, single_date):
     # left tiny CSVs that caused all subsequent runs to skip the date forever.
     # HKJC meetings always have 8-11 races x 10-14 horses = 80-150 rows + header,
     # so a results file with <30 rows is a partial scrape that must be retried.
-    if all(os.path.exists(f) for f in [results_file, dividends_file, sectional_file, commentary_file, video_file]):
-        if _csv_row_count(results_file) >= 30:
-            return "skip"
-        print(f"[skip-check] {formatted_date} CSVs exist but results has <30 rows -> re-scraping", flush=True)
+    def _csv_race_nos(path):
+        try:
+            df = pd.read_csv(path, encoding="utf-8-sig", usecols=["race_no"])
+            return set(int(x) for x in df["race_no"].dropna())
+        except Exception:
+            return set()
+
+    files_exist = all(os.path.exists(f) for f in [results_file, dividends_file, sectional_file, commentary_file, video_file])
 
     main_url = f"{BASE_URL}?RaceDate={meet_date}"
     if not load_page(driver, main_url):
         log_failed(formatted_date, "page load failed")
-        return "fail"
+        return "skip" if files_exist and _csv_row_count(results_file) >= 30 else "fail"
 
     if not driver.find_elements(By.CLASS_NAME, "race_tab"):
         return "norace"
@@ -391,6 +395,15 @@ def scrape_one_date(driver, single_date):
     # listed). Initialize as empty here.
     venue     = ""
     race_urls = get_race_urls(driver, meet_date)
+
+    # Fix (2026-09-24): a mid-meeting run (e.g. R1-R4 = 49 rows) passed the old
+    # ">=30 rows" skip test, so later runs skipped the date and R5-R9 were never
+    # collected. Skip only when the CSV already holds every race HKJC lists.
+    if files_exist:
+        have = _csv_race_nos(results_file)
+        if have and len(have) >= len(race_urls):
+            return "skip"
+        print(f"[skip-check] {formatted_date} CSV has races {sorted(have)} but HKJC lists {len(race_urls)} -> re-scraping", flush=True)
 
     all_results, all_dividends, all_sectional, all_commentary, all_videos = [], [], [], [], []
 
