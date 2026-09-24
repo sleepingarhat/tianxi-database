@@ -7,12 +7,12 @@ Subcommands:
   prerace   Post the race-day preview + 1 free featured pick (morning of a HK race day).
   postrace  Post the post-race hit-rate recap (after results land).
 
-Reads only the public API (https://tianxi.racing). Posts via Telegram Bot API.
+Reads only the public backend API (workers.dev; tianxi.racing/api/* is served by the site and 404s). Posts via Telegram Bot API.
 
 Env:
   TELEGRAM_BOT_TOKEN  (required)  bot token; bot must be admin of the channel.
   TG_CHANNEL          (optional)  default @TX_Oracle
-  TX_API_BASE         (optional)  default https://tianxi.racing
+  TX_API_BASE         (optional)  default https://tianxi-backend.tianxi-entertainment.workers.dev
   TX_SITE_BASE        (optional)  default https://tianxi-site.pages.dev
 """
 import os
@@ -27,7 +27,7 @@ import re
 from datetime import datetime, timezone, timedelta
 
 HK_TZ = timezone(timedelta(hours=8))
-API_BASE = os.environ.get("TX_API_BASE", "https://tianxi.racing").rstrip("/")
+API_BASE = os.environ.get("TX_API_BASE", "https://tianxi-backend.tianxi-entertainment.workers.dev").rstrip("/")
 SITE_BASE = os.environ.get("TX_SITE_BASE", "https://tianxi-site.pages.dev").rstrip("/")
 CHANNEL = os.environ.get("TG_CHANNEL", "@TX_Oracle")
 MEMBERSHIP_URL = SITE_BASE + "/membership/"
@@ -56,8 +56,19 @@ def fmt_date(iso):
 def api_get(path):
     url = API_BASE + path
     req = urllib.request.Request(url, headers={"User-Agent": "tx-tg-notify", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return json.loads(r.read().decode("utf-8"))
+    last = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            last = err
+            if err.code < 500 and err.code != 429:
+                raise
+        except (urllib.error.URLError, TimeoutError) as err:
+            last = err
+        time.sleep(5 * (2 ** attempt))
+    raise last
 
 
 def tg_send(text):
