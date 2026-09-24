@@ -1,4 +1,5 @@
 ﻿horse_no,race_index,place,date,racecourse,track,course,distance_m,going,race_class,draw,rating,trainer,jockey,lbw,win_odds,actual_wt_lbs,running_position,finish_time,declared_wt_lbs,gear
+E301,043,08,23/09/26,跑馬地,草地,C,1200,好,3,7,68,廖康銘,梁家俊,2-1/2,19,127,10 9 8,1.10.04,1101,B
 E301,018,05,09/09/26,跑馬地,草地,A,1200,好,3,4,68,廖康銘,巴度,2-1/2,12,126,6 6 5,1.11.11,1101,B
 E301,846,04,08/07/26,跑馬地,草地,B,1200,好,3,7,68,廖康銘,巴度,1-1/4,20,125,3 3 4,1.09.82,1105,B
 E301,751,01,03/06/26,跑馬地,草地,C,1200,好/快,3,6,63,廖康銘,巴度,鼻位,8.8,120,1 1 1,1.09.25,1098,B
