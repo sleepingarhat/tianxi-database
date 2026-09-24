@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tx_poster import render_meeting, render_post, render_pre, tg_send_document
 
 HK_TZ = timezone(timedelta(hours=8))
-API_BASE = os.environ.get("TX_API_BASE", "https://www.tianxi.racing").rstrip("/")
+API_BASE = os.environ.get("TX_API_BASE", "https://tianxi-backend.tianxi-entertainment.workers.dev").rstrip("/")
 CHANNEL = os.environ.get("TG_CHANNEL", "@TX_Oracle")
 VENUE_CH = {"ST": "沙田", "HV": "跑馬地"}
 WEEKDAY_CH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
