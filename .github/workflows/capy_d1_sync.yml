@@ -12,6 +12,9 @@ on:
   # to finish scrape + commit before we try to push delta to D1.
   schedule:
     - cron: '23 16 * * *'   # 00:23 HK (after race_daily 23:30 HK)
+    # 後備補跑（2026-10-02）：寫入已改成重複即略過，重跑安全。HK 06:23 / 10:23
+    - cron: '23 22 * * *'
+    - cron: '23 2 * * *'
   workflow_dispatch:
     inputs:
       date:
@@ -184,7 +187,14 @@ jobs:
             for f in /tmp/d1-delta/${t}-*.sql; do
               [ -f "$f" ] || continue
               base=$(basename "$f")
-              if wrangler d1 execute tianxi-db --remote --file="$f" >/tmp/out.log 2>&1; then
+              # 後備補跑安全：已存在嘅行略過，唔會撞 UNIQUE（賽果只增不改）
+              sed -i -E 's/^INSERT INTO /INSERT OR IGNORE INTO /' "$f"
+              ok=0
+              for try in 1 2 3; do
+                if wrangler d1 execute tianxi-db --remote --file="$f" >/tmp/out.log 2>&1; then ok=1; break; fi
+                grep -q "long-running import" /tmp/out.log && sleep 45 || break
+              done
+              if [ "$ok" -eq 1 ]; then
                 echo "OK  $base"
               else
                 echo "FAIL $base"
