@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "generated_at": "2026-09-30T10:29:17+00:00",
+  "generated_at": "2026-10-01T10:57:04+00:00",
   "generator": "tools/build_manifest.py",
-  "git_head": "3e8df1b8f56e3a89d8b054686f4099a0870d355c",
+  "git_head": "324367a0411446f77ad5636fd15f2f242a3086aa",
   "repo": "sleepingarhat/tianxi-database",
   "branch": "main",
   "base_url": {
@@ -15,8 +15,8 @@
     "readme": "README.md"
   },
   "summary": {
-    "race_days": 943,
-    "race_artefact_files": 4709,
+    "race_days": 944,
+    "race_artefact_files": 4714,
     "fixtures_rows": 231,
     "horse_form_files": 6078,
     "horse_profile_rows": 6078,
@@ -49,16 +49,16 @@
       "path_template": "data/{year}/{kind}_{date}.csv",
       "raw_url_template": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/data/{year}/{kind}_{date}.csv",
       "count_by_kind": {
-        "results": 937,
-        "commentary": 943,
-        "dividends": 943,
-        "sectional": 943,
-        "video": 943
+        "results": 938,
+        "commentary": 944,
+        "dividends": 944,
+        "sectional": 944,
+        "video": 944
       },
-      "distinct_race_days": 943,
+      "distinct_race_days": 944,
       "date_range": {
         "start": "2016-01-01",
-        "end": "2026-09-27"
+        "end": "2026-10-01"
       },
       "season_years": [
         2016,
@@ -74,7 +74,7 @@
         2026
       ],
       "example": {
-        "results": "data/2026/results_2026-09-27.csv"
+        "results": "data/2026/results_2026-10-01.csv"
       }
     },
     "fixtures": {
@@ -175,10 +175,10 @@
   "integrity": {
     "latest_report": "audit_reports/integrity_latest.json",
     "raw_url": "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/main/audit_reports/integrity_latest.json",
-    "scan_date": "2026-09-30",
+    "scan_date": "2026-10-01",
     "overall_severity": "critical",
     "critical_gap_count": 1,
-    "warn_gap_count": 12,
+    "warn_gap_count": 24,
     "recommendation": "gha_next_delta_will_fix"
   },
   "policy": {
