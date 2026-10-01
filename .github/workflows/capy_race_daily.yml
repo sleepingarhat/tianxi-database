@@ -10,6 +10,11 @@ on:
   schedule:
     # HK 23:30 daily = UTC 15:30
     - cron: '30 15 * * *'
+    # 後備補跑（2026-10-02）：GitHub 排程常遲幾個鐘；賽日窗口係今日∨昨日（香港），
+    # 已收齊會按場號集合自動跳過，所以重跑安全。HK 01:30 / 04:30 / 09:30
+    - cron: '30 17 * * *'
+    - cron: '30 20 * * *'
+    - cron: '30 1 * * *'
   workflow_dispatch:
     inputs:
       date:
