@@ -1,6 +1,6 @@
-# Data Integrity Audit · 2026-09-30
+# Data Integrity Audit · 2026-10-01
 
-**Overall:** 🔴 `critical`  ·  critical gaps: **1**  ·  warn gaps: 12
+**Overall:** 🔴 `critical`  ·  critical gaps: **1**  ·  warn gaps: 24
 
 **Recommendation:** `gha_next_delta_will_fix`
 
@@ -8,9 +8,9 @@
 
 | Category | Severity | Expected | Present | Missing | Stale | Notes |
 |---|---|---|---|---|---|---|
-| race_artefacts | 🟡 warn | 750 | 745 | 5 | 0 | days with any missing artefact: 1 |
+| race_artefacts | 🟡 warn | 755 | 750 | 5 | 0 | days with any missing artefact: 1 |
 | fixtures_cache | 🟢 ok | 1 | 231 | 0 | 0 | total cached race days: 231 |
-| horse_profiles | 🟢 ok | 1189 | 1189 | 0 | 0 | total profiles in DB: 6078 |
+| horse_profiles | 🟡 warn | 1189 | 1189 | 0 | 12 | 12 profiles are stale (profile_last_scraped < last_race_date); total profiles in DB: 6078 |
 | horse_form_records | 🟢 ok | 1189 | 1189 | 0 | 0 | total form_records files: 6078 |
 | jockey_profiles | 🟢 ok | 32 | 32 | 0 | 0 | total jockey profiles: 64 |
 | jockey_records | 🟡 warn | 64 | 59 | 5 | 0 | 5 jockey profiles have no records file |
