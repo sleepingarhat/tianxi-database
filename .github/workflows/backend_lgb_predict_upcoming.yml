@@ -1,0 +1,371 @@
+name: LGB Predict Upcoming (Stage 7)
+
+# Trains LightGBM on full history (bulk-local.db) and POSTs per-runner scores
+# for upcoming races back to prod via /admin/api/lgb-predictions.
+# analyze.ts reads these scores and uses lgb_score as the primary ranking
+# signal when present. Cache key mirrors lgb_walkforward.yml so the DB
+# rebuilt by that workflow is reused here (and vice versa).
+
+on:
+  workflow_dispatch:
+    inputs:
+      days_ahead:
+        description: 'How many days ahead to score'
+        required: false
+        default: '7'
+      force_rebuild_db:
+        description: 'Ignore cache and rebuild bulk-local.db'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '0 20 * * *'  # 04:00 HKT — after capy_racecard daily sync
+
+concurrency:
+  group: lgb-predict-upcoming
+  cancel-in-progress: false
+
+jobs:
+  season_gate:
+    # 休季自動化 (2026-08-18): scheduled runs short-circuit during the HK
+    # off-season. Status comes from the backend /api/season (D1-derived:
+    # no future ST/HV meeting + >12-day gap = off_season; admin override
+    # via app_settings season_mode). Fail-open: any curl/parse failure is
+    # treated as in_season so we never skip a real race day. Manual
+    # dispatch / workflow_run triggers are NEVER gated.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.chk.outputs.skip }}
+    steps:
+      - id: chk
+        name: Season gate (off-season auto-pause)
+        run: |
+          SKIP=false
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            STATUS=$(curl -sf --max-time 20 "https://tianxi-backend.tianxi-entertainment.workers.dev/api/season" | grep -o '"status":"[a-z_]*"' | head -1 | cut -d'"' -f4 || true)
+            echo "season status: ${STATUS:-unknown (fail-open)}"
+            if [ "$STATUS" = "off_season" ]; then
+              SKIP=true
+              echo "::notice::休季中 off-season — skipping scheduled run (auto-resumes when the new season racecard appears)"
+            fi
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+  predict:
+    needs: season_gate
+    if: needs.season_gate.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with:
+          path: tianxi-backend
+
+      - name: Checkout data (public repo, sparse)
+        uses: actions/checkout@v4
+        with:
+          repository: sleepingarhat/tianxi-database
+          path: hkjc-data
+          sparse-checkout: |
+            data
+            horses/form_records
+            horses/profiles
+            last_sync.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+          cache-dependency-path: tianxi-backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install backend deps
+        working-directory: tianxi-backend
+        run: npm ci
+
+      - name: Install python deps
+        run: pip install --quiet lightgbm pandas numpy scikit-learn scipy
+
+      - name: Compute data signature (cache key — must match lgb_walkforward.yml)
+        id: sig
+        run: |
+          DATA_SHA=$(cd hkjc-data && git rev-parse HEAD)
+          SCRIPTS_HASH=$(find tianxi-backend/scripts/ingest tianxi-backend/scripts/elo tianxi-backend/scripts/import-csv.ts tianxi-backend/src/db/schema.sql -type f 2>/dev/null | sort | xargs sha256sum | sha256sum | head -c12)
+          KEY="lgb-db-${DATA_SHA:0:12}-${SCRIPTS_HASH}"
+          echo "key=$KEY" >> $GITHUB_OUTPUT
+          echo "Cache key: $KEY"
+
+      - name: Compute feature-cache key (data + dump-features.ts hash)
+        id: featsig
+        run: |
+          FEAT_HASH=$(sha256sum tianxi-backend/scripts/backtest/dump-features.ts | cut -c1-12)
+          DATA_SHA=$(cd hkjc-data && git rev-parse HEAD)
+          SCRIPTS_HASH=$(echo "${{ steps.sig.outputs.key }}" | awk -F- '{print $NF}')
+          # Feature-hash FIRST so restore-keys can fall back to yesterday's
+          # features.csv (same columns, same ingest scripts, older data) and we
+          # only dump the missing tail instead of ~2h of full history.
+          PREFIX="lgb-feat-${FEAT_HASH}-${SCRIPTS_HASH}-"
+          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+          echo "key=${PREFIX}${DATA_SHA:0:12}" >> $GITHUB_OUTPUT
+          echo "Feature cache key: ${PREFIX}${DATA_SHA:0:12}"
+
+      - name: Restore bulk-local.db cache
+        id: db-cache
+        if: inputs.force_rebuild_db != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: tianxi-backend/bulk-local.db
+          key: ${{ steps.sig.outputs.key }}
+
+      - name: Build bulk-local.db (import results CSVs)
+        if: steps.db-cache.outputs.cache-hit != 'true'
+        working-directory: tianxi-backend
+        run: |
+          npx tsx scripts/import-csv.ts --data-dir ../hkjc-data/data --db ./bulk-local.db
+          ls -lh bulk-local.db
+
+      - name: Ingest horse form records
+        if: steps.db-cache.outputs.cache-hit != 'true'
+        working-directory: tianxi-backend
+        run: |
+          npx tsx scripts/ingest/index.ts form --data-dir=../hkjc-data --db=./bulk-local.db
+          ls -lh bulk-local.db
+
+      - name: Ingest horse pedigree (sire/dam -> horse_pedigree for LGB feature 4)
+        if: steps.db-cache.outputs.cache-hit != 'true'
+        working-directory: tianxi-backend
+        run: |
+          npx tsx scripts/ingest/index.ts pedigree --data-dir=../hkjc-data --db=./bulk-local.db
+          ls -lh bulk-local.db
+
+      - name: Compute ELO ratings
+        if: steps.db-cache.outputs.cache-hit != 'true'
+        working-directory: tianxi-backend
+        run: |
+          npx tsx scripts/elo/compute.ts --db=./bulk-local.db --reset
+          ls -lh bulk-local.db
+
+      - name: Save bulk-local.db cache
+        if: always() && steps.db-cache.outputs.cache-hit != 'true' && hashFiles('tianxi-backend/bulk-local.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: tianxi-backend/bulk-local.db
+          key: ${{ steps.sig.outputs.key }}
+
+      - name: DB sanity counts
+        working-directory: tianxi-backend
+        run: |
+          sudo apt-get -qq install -y sqlite3 >/dev/null 2>&1 || true
+          sqlite3 bulk-local.db "SELECT 'meetings:' || COUNT(*) FROM race_meetings;
+            SELECT 'races:' || COUNT(*) FROM races;
+            SELECT 'results:' || COUNT(*) FROM race_results;
+            SELECT 'form_records:' || COUNT(*) FROM horse_form_records;"
+          # pedigree guard: a sparse-checkout miss would silently null every
+          # sire/damsire feature (see memory tx-sparse-checkout-ci). Fail loud
+          # on a fresh (non-cached) build so train/serve never skews.
+          PED=$(sqlite3 bulk-local.db "SELECT COUNT(*) FROM horse_pedigree;" 2>/dev/null || echo 0)
+          echo "horse_pedigree rows: $PED"
+          if [ "${{ steps.db-cache.outputs.cache-hit }}" != 'true' ] && [ "${PED:-0}" -lt 1000 ]; then
+            echo "FATAL: horse_pedigree has $PED rows (<1000) — pedigree ingest/sparse-checkout broken"; exit 1
+          fi
+
+      - name: Restore features.csv cache
+        id: feat-cache
+        if: inputs.force_rebuild_db != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: tianxi-backend/features.csv
+          key: ${{ steps.featsig.outputs.key }}
+          restore-keys: |
+            ${{ steps.featsig.outputs.prefix }}
+
+      - name: Dump training features (full history)
+        # SPEED: the full-history dump (2016→yesterday, ~98k rows incl the
+        # pedigree as-of encoding) costs ~2h. It only changes when the data
+        # (DATA_SHA) or dump-features.ts logic changes — both folded into the
+        # feature-cache key — so on a cache hit we skip the dump entirely and
+        # only the (cheap) upcoming-entries dump runs against bulk-local.db.
+        if: steps.feat-cache.outputs.cache-hit != 'true'
+        working-directory: tianxi-backend
+        run: |
+          YESTERDAY=$(date -u -d 'yesterday' +%Y-%m-%d)
+          # INCREMENTAL PATH: an older features.csv restored via restore-keys
+          # (same feature logic + same ingest scripts, older data snapshot) only
+          # needs the days after its last race_date appended. Full dump is the
+          # fallback when there is no partial hit or the header changed.
+          INCREMENTAL=false
+          if [ -f features.csv ]; then
+            rm -f /tmp/feat-header.csv
+            npx tsx scripts/backtest/dump-features.ts \
+              --db=bulk-local.db --from=2099-01-01 --to=2099-01-02 \
+              --out=/tmp/feat-header.csv >/dev/null 2>&1 || true
+            EXPECTED_HEADER=$(head -1 /tmp/feat-header.csv 2>/dev/null || true)
+            CACHED_HEADER=$(head -1 features.csv)
+            LAST_DATE=$(tail -n +2 features.csv | cut -d, -f2 | sort | tail -1)
+            if [ -n "$EXPECTED_HEADER" ] && [ "$EXPECTED_HEADER" = "$CACHED_HEADER" ] && [ -n "$LAST_DATE" ]; then
+              FROM_INC=$(date -u -d "$LAST_DATE +1 day" +%Y-%m-%d)
+              if [ "$FROM_INC" \> "$YESTERDAY" ]; then
+                echo "cached features already cover through $LAST_DATE — nothing to append"
+                INCREMENTAL=true
+              else
+                echo "incremental dump $FROM_INC .. $YESTERDAY (cached through $LAST_DATE)"
+                npx tsx scripts/backtest/dump-features.ts \
+                  --db=bulk-local.db \
+                  --from=$FROM_INC --to=$YESTERDAY \
+                  --out=features-inc.csv
+                tail -n +2 features-inc.csv >> features.csv
+                rm -f features-inc.csv
+                INCREMENTAL=true
+              fi
+            else
+              echo "cached features unusable (header changed or empty) — full rebuild"
+              rm -f features.csv
+            fi
+          fi
+          if [ "$INCREMENTAL" != 'true' ]; then
+            npx tsx scripts/backtest/dump-features.ts \
+              --db=bulk-local.db \
+              --from=2016-09-01 --to=$YESTERDAY \
+              --out=features.csv
+          fi
+          echo "training rows: $(wc -l < features.csv)"
+
+      - name: Save features.csv cache
+        if: always() && steps.feat-cache.outputs.cache-hit != 'true' && hashFiles('tianxi-backend/features.csv') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: tianxi-backend/features.csv
+          key: ${{ steps.featsig.outputs.key }}
+
+      - name: Fetch upcoming entries from prod
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN_2 }}
+          DAYS_AHEAD: ${{ inputs.days_ahead || '7' }}
+        working-directory: tianxi-backend
+        run: |
+          FROM=$(date -u +%Y-%m-%d)
+          TO=$(date -u -d "+${DAYS_AHEAD} day" +%Y-%m-%d)
+          echo "Fetching entries $FROM .. $TO"
+          curl -fsSL -H "Authorization: Bearer $ADMIN_TOKEN" \
+            "https://tianxi-backend.tianxi-entertainment.workers.dev/admin/api/entries-upcoming-export?from=$FROM&to=$TO" \
+            -o upcoming-entries.json
+          echo "Entry count: $(jq '.count' upcoming-entries.json)"
+          jq '.entries[0]' upcoming-entries.json || true
+
+      - name: Dump features for upcoming entries
+        working-directory: tianxi-backend
+        run: |
+          npx tsx scripts/backtest/dump-features.ts \
+            --db=bulk-local.db \
+            --upcoming-json=upcoming-entries.json \
+            --out=upcoming-features.csv
+          echo "upcoming feature rows: $(wc -l < upcoming-features.csv)"
+          head -2 upcoming-features.csv | cut -c1-200
+
+      - name: Train LGB + predict + upload to prod
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN_2 }}
+        working-directory: tianxi-backend
+        run: |
+          MODEL_VER="lgb-ensemble-$(date -u +%Y%m%d)"
+          python scripts/backtest/predict_upcoming.py \
+            --train=features.csv \
+            --upcoming=upcoming-features.csv \
+            --admin-url=https://tianxi-backend.tianxi-entertainment.workers.dev/admin/api/lgb-predictions \
+            --token="$ADMIN_TOKEN" \
+            --model-version="$MODEL_VER" \
+            --save-bundle=model-bundle \
+            --auto-alpha \
+            --alpha-pass=0.88
+
+      # 2026-09-13 韌性：把今次嘅生產模型（booster + τ/α + FEAT_COLS）凍結入
+      # cache，供 lgb_fast_predict.yml 喺重訓失敗／未跑完時「用昨日模型」頂住，
+      # 而唔係全站退回 ELO 基準（紅燈初稿）。
+      - name: Save model bundle cache (carry-over fallback)
+        if: always() && hashFiles('tianxi-backend/model-bundle/model.txt') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: tianxi-backend/model-bundle
+          key: lgb-model-v1-${{ github.run_id }}
+
+      # 2026-09-24 鎖點 bundle 驗證：model.txt／meta.json／特徵檔／run_id 必須互相對應，
+      # 缺檔或指紋不符即 fail。只讀驗證，唔改訓練、POST、α、四揀。
+      - name: Verify lock-point bundle (fail-closed)
+        working-directory: tianxi-backend
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import csv, hashlib, json, os, sys
+          errs = []
+          need = ['model-bundle/model.txt', 'model-bundle/meta.json', 'upcoming-features.csv', 'features.csv']
+          for f in need:
+              if not os.path.isfile(f) or os.path.getsize(f) == 0:
+                  errs.append(f'missing/empty: {f}')
+          if errs:
+              print('\n'.join(errs)); sys.exit(1)
+          meta = json.load(open('model-bundle/meta.json'))
+          cols = meta.get('featCols') or []
+          booster_cols = []
+          for line in open('model-bundle/model.txt'):
+              if line.startswith('feature_names='):
+                  booster_cols = line.strip().split('=', 1)[1].split(' '); break
+          import re as _re
+          generic = all(_re.fullmatch(r'Column_\d+', c) for c in booster_cols)
+          if generic:
+              # 訓練用 numpy 矩陣（train[FEAT_COLS].to_numpy()），LightGBM 會寫 Column_N；
+              # 預測同樣用 numpy，欄序由 FEAT_COLS 保證，所以只核數量。
+              if len(booster_cols) != len(cols):
+                  errs.append(f'booster feature count != meta.featCols ({len(booster_cols)} vs {len(cols)})')
+          elif booster_cols != cols:
+              errs.append(f'booster feature_names != meta.featCols ({len(booster_cols)} vs {len(cols)})')
+          for f in ['upcoming-features.csv', 'features.csv']:
+              hdr = next(csv.reader(open(f)))
+              miss = [c for c in cols if c not in hdr]
+              if miss: errs.append(f'{f} missing feature cols: {miss}')
+          if not str(meta.get('modelVersion', '')).startswith('lgb-ensemble-'):
+              errs.append(f'bad modelVersion: {meta.get("modelVersion")}')
+          sha = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+          man = {
+              'runId': os.environ['RUN_ID'], 'runAttempt': os.environ['RUN_ATTEMPT'],
+              'headSha': os.environ['HEAD_SHA'], 'modelVersion': meta.get('modelVersion'),
+              'alpha': meta.get('alpha'), 'nFeatures': len(cols),
+              'sha256': {p: sha(p) for p in ['model-bundle/model.txt', 'model-bundle/meta.json', 'upcoming-features.csv']},
+          }
+          man['bundleFingerprint'] = hashlib.sha256((man['sha256']['model-bundle/model.txt'] + man['sha256']['model-bundle/meta.json']).encode()).hexdigest()[:24]
+          json.dump(man, open('model-bundle/lock-manifest.json', 'w'), indent=2)
+          print(json.dumps(man, indent=2))
+          if errs:
+              print('VERIFY FAILED:\n' + '\n'.join(errs)); sys.exit(1)
+          print('lock-point bundle verified')
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lgb-predict-upcoming
+          path: |
+            tianxi-backend/upcoming-entries.json
+            tianxi-backend/upcoming-features.csv
+            tianxi-backend/features.csv
+            tianxi-backend/model-bundle/model.txt
+            tianxi-backend/model-bundle/meta.json
+            tianxi-backend/model-bundle/lock-manifest.json
+          if-no-files-found: warn
+          retention-days: 14
