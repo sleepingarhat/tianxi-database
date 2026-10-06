@@ -26,6 +26,7 @@ export type AdminAuthPolicy = typeof ADMIN_AUTH_POLICY[keyof typeof ADMIN_AUTH_P
 
 export interface AdminAuthEnv {
   ADMIN_TOKEN?: string;
+  ADMIN_TOKEN_2?: string;
   SESSION_HMAC_SECRET?: string;
   ADMIN_GITHUB_USER?: string;
 }
@@ -145,9 +146,9 @@ export async function issueAdminTokenSession(
   env: AdminAuthEnv,
   presented: string,
 ): Promise<string | null> {
-  const expected = env.ADMIN_TOKEN;
   const got = normalizePresentedAdminSecret(presented);
-  if (!expected || !got || got !== expected) return null;
+  const expected = [env.ADMIN_TOKEN, env.ADMIN_TOKEN_2].filter((t): t is string => Boolean(t));
+  if (!expected.length || !got || !expected.includes(got)) return null;
   const secret = sessionSigningSecret(env);
   if (!secret) return null;
   return signSession(newSessionPayload(TOKEN_SESSION_USER), secret);
@@ -187,11 +188,11 @@ export async function hasAdminAccess(
     }
   }
 
-  const expected = c.env.ADMIN_TOKEN;
-  if (!expected) return false;
+  const expected = [c.env.ADMIN_TOKEN, c.env.ADMIN_TOKEN_2].filter((t): t is string => Boolean(t));
+  if (!expected.length) return false;
   const header = c.req.header('authorization') || '';
   const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
-  return bearer === expected;
+  return expected.includes(bearer);
 }
 
 export function buildAdminBearerHeaders(env: AdminAuthEnv): { authorization: string } | undefined {
