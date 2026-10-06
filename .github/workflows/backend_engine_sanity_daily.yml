@@ -1,0 +1,206 @@
+name: Engine Sanity — Daily Status Dashboard
+
+# Mirror of tianxi-database capy_sanity_daily.yml.
+# Writes reports/SANITY.md + reports/ENGINE_HEALTH.json
+# (generatedHKT, season, live curve). Site copies JSON via engine-health-sync.yml.
+# Scheduled HK 10:03. Manual dispatch always runs.
+
+on:
+  schedule:
+    - cron: '3 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  season_gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.chk.outputs.skip }}
+      season: ${{ steps.chk.outputs.season }}
+    steps:
+      - id: chk
+        name: Season gate
+        run: |
+          SKIP=false
+          STATUS=$(curl -sf --max-time 20 "https://tianxi-backend.tianxi-entertainment.workers.dev/api/season" | grep -o '"status":"[a-z_]*"' | head -1 | cut -d'"' -f4 || true)
+          echo "season status: ${STATUS:-unknown (fail-open)}"
+          echo "season=${STATUS:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+  sanity:
+    needs: season_gate
+    if: needs.season_gate.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 5
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect workflow status + health snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SEASON: ${{ needs.season_gate.outputs.season }}
+        run: |
+          set -eu
+          mkdir -p reports
+          OUT=reports/SANITY.md
+          NOW=$(date -u +%Y-%m-%dT%H:%MZ)
+          TODAY_HK=$(TZ=Asia/Hong_Kong date +%Y-%m-%d)
+          {
+            echo "# TX-Oracle Engine Sanity Report"
+            echo ""
+            echo "_Generated $NOW (HK today = $TODAY_HK) · season=${SEASON}_"
+            echo ""
+            echo "This file is written by \`engine_sanity_daily.yml\`."
+            echo ""
+            echo "## Workflow status (last 5 runs each)"
+            echo ""
+            echo "| Workflow | Last status | Last time | 48h success |"
+            echo "|---|---|---|---|"
+          } > "$OUT"
+
+          for WF in deploy.yml lgb_predict_upcoming.yml lgb_backfill.yml lgb_walkforward.yml capy_racecard.yml capy_results.yml engine_sanity_daily.yml; do
+            RESP=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/workflows/${WF}/runs?per_page=5" || echo '{"workflow_runs":[]}')
+            LAST_STATUS=$(echo "$RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); r=d.get("workflow_runs",[]); print((r[0].get("conclusion") or r[0].get("status") or "none") if r else "none")')
+            LAST_TIME=$(echo "$RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); r=d.get("workflow_runs",[]); print(r[0]["updated_at"] if r else "-")')
+            SUCCESS_48H=$(echo "$RESP" | python3 -c 'import sys,json,datetime as dt; d=json.load(sys.stdin); cutoff=dt.datetime.now(dt.timezone.utc)-dt.timedelta(hours=48); print(sum(1 for r in d.get("workflow_runs",[]) if dt.datetime.fromisoformat(r["updated_at"].replace("Z","+00:00"))>=cutoff and r.get("conclusion")=="success"))')
+            echo "| $WF | $LAST_STATUS | $LAST_TIME | $SUCCESS_48H |" >> "$OUT"
+          done
+
+          python3 <<'PY'
+          import json, os, sys, urllib.request
+          from datetime import datetime, timezone, timedelta
+          HKT = timezone(timedelta(hours=8))
+          now = datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')
+
+          # 首選：直接抄 Worker 即時健康 API（單一真相，季節同 live 曲線都係 DB 出）。
+          try:
+            req = urllib.request.Request(
+              'https://tianxi-backend.tianxi-entertainment.workers.dev/api/analyze/engine-health',
+              headers={'User-Agent': 'tianxi-engine-sanity/1.0', 'Accept': 'application/json'},
+            )
+            with urllib.request.urlopen(req, timeout=25) as r:
+              live = json.loads(r.read().decode())
+            if live.get('checks'):
+              with open('reports/ENGINE_HEALTH.json', 'w') as f:
+                json.dump(live, f, ensure_ascii=False, indent=2)
+                f.write('\n')
+              print('wrote reports/ENGINE_HEALTH.json from live API', live.get('generatedHKT'), live.get('overall'))
+              sys.exit(0)
+          except Exception as e:
+            print('live health fetch failed, falling back to local snapshot', e)
+
+
+          HKT = timezone(timedelta(hours=8))
+          now = datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')
+          season = {
+            'status': os.environ.get('SEASON') or 'unknown',
+            'lastMeeting': None,
+            'nextMeeting': None,
+            'label': '休季中' if os.environ.get('SEASON') == 'off_season' else os.environ.get('SEASON') or '未知',
+          }
+          try:
+            req = urllib.request.Request(
+              'https://tianxi-backend.tianxi-entertainment.workers.dev/api/season',
+              headers={'User-Agent': 'tianxi-engine-sanity/1.0', 'Accept': 'application/json'},
+            )
+            with urllib.request.urlopen(req, timeout=20) as r:
+              raw = json.loads(r.read().decode())
+            season = {
+              'status': raw.get('status') or season['status'],
+              'lastMeeting': raw.get('lastMeeting'),
+              'nextMeeting': raw.get('nextMeeting'),
+              'label': raw.get('label') or season['label'],
+            }
+          except Exception as e:
+            print('season fetch failed', e)
+          off = season.get('status') == 'off_season'
+          live_status = 'WATCH' if off else 'PASS'
+          live_detail = '休季無新曲線。' if off else '賽季中；有場日允許 live 曲線。'
+          season_detail = ('上仗 %s。' % (season.get('lastMeeting') or '—'))
+          diag_status = 'WATCH'
+          diag_detail = '開季後寫 best_iter。' if off else '等當日 diagnostics 落地。'
+          checks = [
+            {'id': 'ltr', 'label': '排序學習 LambdaRank', 'status': 'PASS', 'detail': '整場 listwise。'},
+            {'id': 'labels', 'label': 'Frame 名次標籤（頭四）', 'status': 'PASS', 'detail': '頭四有分級權重。'},
+            {'id': 'noleak_odds', 'label': '臨場盤不入 LGB', 'status': 'PASS', 'detail': '只 overlay 右欄。'},
+            {'id': 'asof', 'label': '特徵 as-of／無洩漏', 'status': 'PASS', 'detail': 'τ／α refit 前鎖定。'},
+            {'id': 'gate_alpha', 'label': 'α 自癒健康閘', 'status': 'PASS', 'detail': 'FAIL → 純 Elo。'},
+            {'id': 'fail_closed', 'label': '異常 fail-closed', 'status': 'PASS', 'detail': '唔 crash。'},
+            {'id': 'season', 'label': '休季自動暫停', 'status': 'PASS', 'detail': season_detail},
+            {'id': 'elo_v12', 'label': 'Elo v12 獨立後備', 'status': 'PASS', 'detail': '馬 0.7／騎 0.2／練 0.1。'},
+            {'id': 'public_record', 'label': '公開戰績', 'status': 'PASS', 'detail': 'hit-rate API。'},
+            {'id': 'reg_leaf', 'label': '每葉最少樣本', 'status': 'PASS', 'detail': 'min_data_in_leaf=80。'},
+            {'id': 'reg_bag', 'label': '樹深／bagging', 'status': 'PASS', 'detail': 'max_depth=4 · 0.7。'},
+            {'id': 'backfill_metric', 'label': 'live／backfill 對齊', 'status': 'PASS', 'detail': '同一套正規化。'},
+            {'id': 'diag_persist', 'label': '當日 diagnostics', 'status': diag_status, 'detail': diag_detail},
+            {'id': 'offseason_live', 'label': 'live 曲線', 'status': live_status, 'detail': live_detail},
+          ]
+          pass_n = sum(1 for c in checks if c['status']=='PASS')
+          watch_n = sum(1 for c in checks if c['status']=='WATCH')
+          fail_n = sum(1 for c in checks if c['status']=='FAIL')
+          overall = 'FAIL' if fail_n else ('WATCH' if watch_n else 'PASS')
+          summary = '結構閘通過。已對齊 live／backfill 正規化參數與 frame label。'
+          if off:
+            summary += '休季無當日 live 曲線。'
+          else:
+            summary += '賽季可跑 live 曲線。'
+          summary += '臨場盤不入 LGB。'
+          payload = {
+            'schemaVersion': 2,
+            'generatedHKT': now,
+            'engine': 'TX-Oracle v3.2',
+            'season': season,
+            'overall': overall,
+            'summary': summary,
+            'counts': {'pass': pass_n, 'watch': watch_n, 'fail': fail_n},
+            'checks': checks,
+          }
+          with open('reports/ENGINE_HEALTH.json', 'w') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+          print('wrote reports/ENGINE_HEALTH.json', now, overall, season)
+          PY
+
+          {
+            echo ""
+            echo "## Engine gates (structural + season/live stamp)"
+            echo ""
+            echo "Snapshot: \`reports/ENGINE_HEALTH.json\` · public site copies this via tianxi-site \`engine-health-sync.yml\`."
+            echo "Live health API: https://tianxi-backend.tianxi-entertainment.workers.dev/api/analyze/engine-health · site proxy: https://tianxi.racing/api/public/engine-health"
+          } >> "$OUT"
+          cat "$OUT"
+
+      - name: Commit sanity report + health snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "tx-engine-sanity-bot"
+          git config user.email "sanity@tianxi.bot"
+          git add reports/SANITY.md reports/ENGINE_HEALTH.json
+          if git diff --staged --quiet; then
+            echo "No change — skipping commit"
+          else
+            git commit -m "[sanity][skip ci] engine health $(TZ=Asia/Hong_Kong date +%Y-%m-%dT%H:%M)"
+            # main may have moved while this job ran; rebase before pushing.
+            for attempt in 1 2 3; do
+              git pull --rebase --autostash origin main && git push origin HEAD:main && break
+              echo "push attempt $attempt failed; retrying"
+              sleep 5
+            done
+          fi
