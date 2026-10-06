@@ -30,9 +30,6 @@ jobs:
     # treated as in_season so we never skip a real race day. Manual
     # dispatch / workflow_run triggers are NEVER gated.
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
     timeout-minutes: 5
     outputs:
       skip: ${{ steps.chk.outputs.skip }}
