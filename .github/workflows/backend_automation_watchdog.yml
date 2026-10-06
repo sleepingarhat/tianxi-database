@@ -24,9 +24,6 @@ permissions:
 jobs:
   watchdog:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
     timeout-minutes: 10
     steps:
       - name: Check pipelines and today's model coverage
