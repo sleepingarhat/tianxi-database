@@ -34,9 +34,6 @@ concurrency:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
     timeout-minutes: 5
     outputs:
       need: ${{ steps.chk.outputs.need }}
