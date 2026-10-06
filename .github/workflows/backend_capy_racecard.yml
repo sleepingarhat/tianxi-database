@@ -1,0 +1,109 @@
+name: Capy Racecard — enrich entries_upcoming via hkjc-api
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Race date (YYYY-MM-DD, blank = auto from API)'
+        required: false
+        default: ''
+      venue:
+        description: 'Venue code (ST / HV, blank = auto from API)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run (no DB writes)'
+        required: false
+        default: 'false'
+  # DISABLED 2026-05-26 — schedule consistently failed at "Push enriched entries to D1".
+  # Canonical racecard scraper lives in tianxi-database/.github/workflows/capy_racecard.yml
+  # (now chained off capy_d1_sync_entries). Kept here for manual workflow_dispatch only.
+  # schedule:
+  #   - cron: '30 0 * * 1,3,5,6'
+
+jobs:
+  season_gate:
+    # 休季自動化 (2026-08-18): scheduled runs short-circuit during the HK
+    # off-season. Status comes from the backend /api/season (D1-derived:
+    # no future ST/HV meeting + >12-day gap = off_season; admin override
+    # via app_settings season_mode). Fail-open: any curl/parse failure is
+    # treated as in_season so we never skip a real race day. Manual
+    # dispatch / workflow_run triggers are NEVER gated.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.chk.outputs.skip }}
+    steps:
+      - id: chk
+        name: Season gate (off-season auto-pause)
+        run: |
+          SKIP=false
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            STATUS=$(curl -sf --max-time 20 "https://tianxi-backend.tianxi-entertainment.workers.dev/api/season" | grep -o '"status":"[a-z_]*"' | head -1 | cut -d'"' -f4 || true)
+            echo "season status: ${STATUS:-unknown (fail-open)}"
+            if [ "$STATUS" = "off_season" ]; then
+              SKIP=true
+              echo "::notice::休季中 off-season — skipping scheduled run (auto-resumes when the new season racecard appears)"
+            fi
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+  enrich-racecard:
+    needs: season_gate
+    if: needs.season_gate.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download bulk-local.db from artifact cache
+        uses: actions/cache@v4
+        id: db-cache
+        with:
+          path: bulk-local.db
+          key: bulk-local-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            bulk-local-db-${{ runner.os }}-
+
+      - name: Scrape race card from HKJC API
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.date }}" ]; then ARGS="$ARGS --date=${{ inputs.date }}"; fi
+          if [ -n "${{ inputs.venue }}" ]; then ARGS="$ARGS --venue=${{ inputs.venue }}"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          npx tsx scripts/scrape-racecard.ts --db=bulk-local.db $ARGS
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Push enriched entries to D1
+        if: inputs.dry_run != 'true'
+        run: |
+          SINCE=$(date -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -v-7d +%Y-%m-%d)
+          npx tsx scripts/push-delta.ts --db=bulk-local.db --include=entries --since=$SINCE
+          bash scripts/push-to-d1.sh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+
+      - name: Save bulk-local.db to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bulk-local.db
+          key: bulk-local-db-${{ runner.os }}-${{ github.run_id }}
