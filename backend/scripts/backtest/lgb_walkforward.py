@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""scripts/backtest/lgb_walkforward.py
+
+Walk-forward LightGBM ranker on per-runner features.
+
+Reads the CSV produced by dump-features.ts. For every race in chronological
+order (after a warm-up of --min-train-races), trains LGBM-LambdaRank on all
+prior races' rows, scores the current race's runners, and takes the argmax
+as the predicted Top-1. Compares hit rates against:
+  * the existing ELO+factor baseline (baseline_score column)
+  * the market favourite (lowest win_odds)
+
+To keep cost bounded the model is retrained every --retrain-every-races
+races; in between, the previous booster scores incoming races.
+
+Usage:
+    python scripts/backtest/lgb_walkforward.py \
+        --features features.csv \
+        --out results.json \
+        --min-train-races 200 \
+        --retrain-every-races 50
+"""
+from __future__ import annotations
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+
+FEATURE_COLS = [
+      "h_elo", "j_elo", "t_elo", "days_since_last",
+      "distance", "draw", "actual_weight", "field_size",
+      "dist_starts", "dist_top3", "going_starts", "going_top3",
+      "draw_starts", "draw_top3", "combo_starts", "combo_top3",
+      "weight_avg5",
+      # raw factor parts that the baseline already encodes — keeping them
+      # lets the GBM learn non-linear interactions the additive baseline misses.
+      "factor_bonus",
+      # Stage 4c: recency-weighted form (per horse, last 5 starts)
+      "form_n", "form_avgpos_w", "form_top3rate_w", "form_pos_slope",
+      # Stage 4c: cross-features (interaction history, no odds)
+      "tv_starts", "tv_top3",     # trainer × venue
+      "jv_starts", "jv_top3",     # jockey × venue
+      "jdb_starts", "jdb_top3",   # jockey × distance band
+        # Stage 5: track-condition specialization
+        "jg_starts", "jg_top3",     # jockey × going
+        "tg_starts", "tg_top3",     # trainer × going
+      # Stage 6 (NEW): pace style + race-level pace clash
+      "horse_pace_n", "horse_pace_early", "horse_pace_style",
+      "race_n_leaders", "race_n_closers", "horse_pace_clash",
+      # Stage 6 (NEW): class change
+      "class_now_num", "last_class_num", "class_delta",
+      # Stage 8 (NEW v3.2 2026-05-25): real sectional aggregates + distance bands
+      # See predict_upcoming.py FEAT_COLS comment for rationale. beaten_lengths
+      # excluded — it's a future regression-head label, not a feature.
+      "sect_n", "sect_early_avg", "sect_late_kick",
+      # ⑥ sectional-SPEED z (sect_early_z / sect_fin_z — first/final section TIME
+      # z-scored within each PAST race's field, leak-safe; -9 sentinel=no data) is
+      # DORMANT: two walk-forward A/B pairs (1299 races, 2024-11→2026-04) gave a
+      # NON-reproducible result — at retrain=50 top1 +0.62 / top3 +0.31, but at
+      # retrain=25 the signs FLIPPED to top1 -0.23 / top3 -0.77 (all within ~1 SE
+      # ≈1.15pp; only top4 consistently up +0.23/+0.92). High importance (~830/799)
+      # but NO robust hit-rate lift → NOT promoted to predict_upcoming.py. Columns
+      # still emitted by dump-features.ts (leak-safe, free) — re-add the two names
+      # here to re-test. (4th pure-feature non-win after ①試閘 / ③場內相對 / ⑤gear.)
+      # Stage 14 (NEW 2026-09-07 ⑧ layoff/comeback): the 2026-09-06 season opener
+      # had 109/120 runners first-up >55d (mean 72d) and top4-intersect fell to
+      # 1.5 (vs 2.33 on 2026-07-15). days_since_last alone gave the model no way
+      # to learn per-horse comeback ability or whole-field first-up discounting.
+      # Candidate stage: validate with a walk-forward A/B (--exclude the eight
+      # names below as the control) BEFORE promoting to predict_upcoming.py.
+      "layoff_band", "is_layoff55", "cb_starts", "cb_top3", "season_starts",
+      "is_season_debut", "field_layoff_frac", "layoff_x_form",
+      # Stage 15 (NEW 2026-09-11 ⑨ non-odds explanation of the favourite bias):
+      # class fit (horse's own record at today's class + its usual class level),
+      # jockey/trainer 180-day rolling strike rate, and draw-position × trip.
+      # Control arm = --exclude these ten names.
+      "hc_starts", "hc_top3", "class_hist_avg", "class_step",
+      "jq_starts", "jq_top3", "tq_starts", "tq_top3", "draw_pct", "draw_x_dist",
+      "is_sprint", "is_middle", "is_distance",
+      "draw_x_sprint", "paceclash_x_distance",
+      # Stage 10 (NEW v3.2 ④ pedigree): leak-safe target-encoded breeding signal.
+      # Smoothed progeny top3-rate as-of race date (sire general / sire at this
+      # distance band / damsire). Missing pedigree → -1.0 sentinel via fillna.
+      "sire_top3_sm", "sire_dist_top3_sm", "damsire_top3_sm",
+      # Stage 13 (⑦ hard-luck): comment-derived trouble signal (recency-weighted
+      # A受阻 + B走大疊 + C出閘失準 over last 8 starts; cmt_n=depth (0=none), frac=-1)
+      # is DORMANT: double-confirmed walk-forward A/B (1299 races, 2024-11→2026-04)
+      # REGRESSED the headline top1 at BOTH cadences (retrain=50 -0.08 / retrain=25
+      # -0.15); top2/top3 were mildly positive (+1.08/+1.54 and +0.92/+0.69) but all
+      # sub-noise (SE≈1.15pp) and top4 flipped (-0.54/+0.46). High importance
+      # (cmt_wide gain ~952) but NO robust top1 lift → NOT promoted to
+      # predict_upcoming.py. Columns still emitted by dump-features.ts (94.7%
+      # coverage, leak-safe, free) — re-add the four names here to re-test in a
+      # future interaction. (5th feature non-win after ①試閘/③場內相對/⑤gear/⑥sect-z;
+      # a genuinely-NEW signal that still cannot beat ELO+form+pedigree saturation.)
+      # "cmt_n", "cmt_trouble", "cmt_wide", "cmt_badstart",
+      # ⑤ gear/equipment-change (gear_first_n/off_n/changed/blinkers) is DORMANT:
+      # walk-forward A/B (1299 races, 2024-11→2026-04) regressed top1 -0.15 /
+      # top2 -0.85 / top3 -0.39pp (only top4 +0.46). Columns still emitted by
+      # dump-features.ts (leak-safe, free) — re-add the names here to re-test a
+      # future interaction, but do NOT promote to predict_upcoming.py without a
+      # walk-forward lift. (Same verdict as ①試閘 / ③場內相對.)
+      # going_code is appended below as a categorical feature.
+  ]
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--features", required=True, help="CSV from dump-features.ts")
+    ap.add_argument("--out", required=True, help="Output JSON path")
+    ap.add_argument("--min-train-races", type=int, default=200,
+                    help="Skip evaluation until this many races have happened")
+    ap.add_argument("--retrain-every-races", type=int, default=50,
+                    help="Retrain frequency (races)")
+    ap.add_argument("--num-leaves", type=int, default=15)
+    ap.add_argument("--learning-rate", type=float, default=0.05)
+    ap.add_argument("--n-estimators", type=int, default=200)
+    ap.add_argument("--min-data-in-leaf", type=int, default=20)
+    ap.add_argument("--objective", choices=["lambdarank", "binary"], default="lambdarank",
+                    help="lambdarank uses position as ranking label; "
+                         "binary uses is_top1 with race-grouping ignored")
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated FEATURE_COLS to drop (A/B ablation control)")
+    return ap.parse_args()
+
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # Categorical going (rare values bucketed)
+    df["going"] = df["going"].fillna("UNKNOWN").astype(str)
+    df["going_code"] = pd.Categorical(df["going"]).codes.astype(int)
+
+    # Sort: chronological day, then by race_id so groups are contiguous.
+    df = df.sort_values(["race_date", "race_id"]).reset_index(drop=True)
+
+    # Coerce numerics + sentinel for missing.
+    for c in FEATURE_COLS:
+        if c not in df.columns:
+            raise SystemExit(f"missing column in features CSV: {c}")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def train_booster(train_df: pd.DataFrame, args: argparse.Namespace, feat_cols: list[str]) -> lgb.Booster:
+    X = train_df[feat_cols].astype(float).fillna(-1.0).to_numpy()
+    if args.objective == "lambdarank":
+        # higher label = better. Clipped to top-5 grades (0..4) to align with
+        # label_gain=[0,1,7,31,127] and lambdarank_truncation_level=4.
+        # FIX 2026-05-27: see predict_upcoming.py make_graded_label for full
+        # rationale. Old `max_pos - pos` produced labels 0..13 → label_gain
+        # saturated 127 for labels 4-13 → 1-tree saturation. Mapping:
+        # 1st→4, 2nd→3, 3rd→2, 4th→1, 5th+→0. Mirror of predict_upcoming.py
+        # so backtest reflects production training signal.
+        pos = train_df["finishing_position"].astype(int).clip(lower=1, upper=5)
+        label = (5 - pos).clip(lower=0).astype(int).to_numpy()
+        groups = train_df.groupby("race_id", sort=False).size().to_numpy()
+        ds = lgb.Dataset(X, label=label, group=groups,
+                         categorical_feature=[feat_cols.index("going_code")])
+        params = {
+            "objective": "lambdarank",
+            "metric": "ndcg",
+            "ndcg_eval_at": [1, 3],
+            # 2026-05-25 (v3.1): truncate gradient to top-4 + exponential gains
+            # to focus learning on positions that decide trio/tierce/QP.
+            # Must mirror predict_upcoming.py so backtest reflects production.
+            "lambdarank_truncation_level": 4,
+            "label_gain": [0, 1, 7, 31, 127, 127, 127, 127, 127, 127, 127, 127,
+                           127, 127, 127, 127, 127, 127, 127, 127],
+            "learning_rate": args.learning_rate,
+            "num_leaves": args.num_leaves,
+            "min_data_in_leaf": args.min_data_in_leaf,
+            "verbose": -1,
+        }
+    else:
+        label = train_df["is_top1"].astype(int).to_numpy()
+        ds = lgb.Dataset(X, label=label,
+                         categorical_feature=[feat_cols.index("going_code")])
+        params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "learning_rate": args.learning_rate,
+            "num_leaves": args.num_leaves,
+            "min_data_in_leaf": args.min_data_in_leaf,
+            "is_unbalance": True,
+            "verbose": -1,
+        }
+    return lgb.train(params, ds, num_boost_round=args.n_estimators)
+
+
+def main() -> int:
+    args = parse_args()
+    df = load(args.features)
+    exclude = {c.strip() for c in args.exclude.split(",") if c.strip()}
+    if exclude:
+        miss = exclude - set(FEATURE_COLS)
+        if miss:
+            print(f"[lgb-wf] WARN: --exclude names not in FEATURE_COLS: {sorted(miss)}", file=sys.stderr)
+        print(f"[lgb-wf] A/B ablation: excluding {sorted(exclude & set(FEATURE_COLS))}", file=sys.stderr)
+    feat_cols = [c for c in FEATURE_COLS if c not in exclude] + ["going_code"]
+
+    race_ids = list(dict.fromkeys(df["race_id"].tolist()))
+    print(f"[lgb-wf] {len(df):,} runner-rows across {len(race_ids):,} races "
+          f"({df['race_date'].min()}..{df['race_date'].max()})", file=sys.stderr)
+
+    race_to_rows = {rid: g for rid, g in df.groupby("race_id", sort=False)}
+
+    booster: lgb.Booster | None = None
+    last_trained_at = -10**9
+    per_race: list[dict] = []
+
+    for i, rid in enumerate(race_ids):
+        test_df = race_to_rows[rid]
+        if len(test_df) < 4:
+            continue
+        if i < args.min_train_races:
+            continue
+
+        if booster is None or (i - last_trained_at) >= args.retrain_every_races:
+            train_mask = df["race_id"].isin(race_ids[:i])
+            train_df = df[train_mask]
+            if len(train_df) < 200:
+                continue
+            booster = train_booster(train_df, args, feat_cols)
+            last_trained_at = i
+            if args.verbose:
+                print(f"  [retrain @ race {i}] {len(train_df):,} rows", file=sys.stderr)
+
+        Xt = test_df[feat_cols].astype(float).fillna(-1.0).to_numpy()
+        scores = booster.predict(Xt)
+        ta = test_df.reset_index(drop=True)
+
+        actual_top1 = ta.loc[ta["finishing_position"].idxmin(), "horse_id"]
+        actual_top2 = set(ta.nsmallest(2, "finishing_position")["horse_id"].tolist())
+        actual_top3 = set(ta.nsmallest(3, "finishing_position")["horse_id"].tolist())
+        actual_top4 = set(ta.nsmallest(4, "finishing_position")["horse_id"].tolist())
+
+        order = np.argsort(-scores)
+        lgb_ranked = ta.iloc[order]["horse_id"].tolist()
+        lgb_top1 = lgb_ranked[0]
+        lgb_top2_set = set(lgb_ranked[:2])
+        lgb_top3_set = set(lgb_ranked[:3])
+        lgb_top4_set = set(lgb_ranked[:min(4, len(lgb_ranked))])
+
+        # ELO+factor baseline pick (highest baseline_score)
+        bs = pd.to_numeric(ta["baseline_score"], errors="coerce")
+        elo_top1 = ta.loc[bs.idxmax(), "horse_id"] if bs.notna().any() else None
+
+        # Market favourite (lowest positive win_odds)
+        odds = pd.to_numeric(ta["win_odds"], errors="coerce")
+        odds_valid = ta[odds > 0]
+        market_top1 = (
+            odds_valid.loc[odds_valid["win_odds"].astype(float).idxmin(), "horse_id"]
+            if len(odds_valid) >= 3 else None
+        )
+
+        per_race.append({
+            "race_id": str(rid),
+            "date": str(ta["race_date"].iloc[0]),
+            "field_size": int(len(ta)),
+            "lgb_top1_hit": bool(lgb_top1 == actual_top1),
+            "lgb_top2_hit": bool(bool(lgb_top2_set & actual_top2)),
+            "lgb_top3_hit": bool(bool(lgb_top3_set & actual_top3)),
+            "lgb_top4_hit": bool(bool(lgb_top4_set & actual_top4)),
+            # 主指標：四揀平均中匹數 = |predicted top4 ∩ actual top4|
+            "lgb_top4_intersect": int(len(lgb_top4_set & actual_top4)),
+            "lgb_top3_intersect": int(len(lgb_top3_set & actual_top3)),
+            "elo_top1_hit": None if elo_top1 is None else bool(elo_top1 == actual_top1),
+            "elo_top3_hit": None if elo_top1 is None else bool(elo_top1 in actual_top3),
+            "market_top1_hit": None if market_top1 is None else bool(market_top1 == actual_top1),
+        })
+
+        if args.verbose and (i + 1) % 200 == 0:
+            print(f"  [{i + 1}/{len(race_ids)}] evaluated", file=sys.stderr)
+
+    rdf = pd.DataFrame(per_race)
+
+    def rate(col: str) -> float | None:
+        if col not in rdf.columns or len(rdf) == 0:
+            return None
+        s = rdf[col].dropna()
+        return float(s.mean()) if len(s) else None
+
+    summary = {
+        "n_races_evaluated": int(len(rdf)),
+        "date_range": (
+            [str(rdf["date"].min()), str(rdf["date"].max())] if len(rdf) else None
+        ),
+        "metrics": {
+            "lgb_top1_hit_rate":    rate("lgb_top1_hit"),
+            "lgb_top2_hit_rate":    rate("lgb_top2_hit"),
+            "lgb_top3_hit_rate":    rate("lgb_top3_hit"),
+            "lgb_top4_hit_rate":    rate("lgb_top4_hit"),
+            "lgb_top4_intersect_avg": (
+                sum(r["lgb_top4_intersect"] for r in per_race) / len(per_race) if per_race else None),
+            "lgb_top3_intersect_avg": (
+                sum(r["lgb_top3_intersect"] for r in per_race) / len(per_race) if per_race else None),
+            "elo_top1_hit_rate":    rate("elo_top1_hit"),
+            "elo_top3_hit_rate":    rate("elo_top3_hit"),
+            "market_top1_hit_rate": rate("market_top1_hit"),
+        },
+        "feature_importance_gain": (
+            dict(zip(feat_cols,
+                     booster.feature_importance(importance_type="gain").tolist()))
+            if booster is not None else {}
+        ),
+        "config": {
+            "objective": args.objective,
+            "min_train_races": args.min_train_races,
+            "retrain_every_races": args.retrain_every_races,
+            "num_leaves": args.num_leaves,
+            "n_estimators": args.n_estimators,
+            "learning_rate": args.learning_rate,
+            "min_data_in_leaf": args.min_data_in_leaf,
+        },
+    }
+
+    out_path = Path(args.out)
+    out_path.write_text(json.dumps(
+        {"summary": summary, "per_race": per_race}, indent=2, default=str))
+
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
