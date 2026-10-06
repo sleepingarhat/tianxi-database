@@ -1,0 +1,4568 @@
+import { Hono } from 'hono';
+import type { Env, AnalyzeRequest } from '../types';
+import { generateAnalysisSummary } from '../services/ai';
+import { fetchLatestWinOddsByRace, attachMarketBlend, MARKET_BLEND_BETA, normHorseKey } from '../lib/market-blend';
+import { parseHkjcDividends, BOX_POOL_MAP } from '../lib/parse-dividends';
+import { computeRaceProbabilities, roundCoverage } from '../lib/pl-prob';
+import { hhmmFromPostTime, fetchPostTimeMap } from '../lib/race-time';
+import {
+  applyPlatt, fitPlatt, scoreSamples, parseCalibration,
+  ODDS_BANDS, bandForOdds,
+  type PlattParams, type Sample, type StoredCalibration,
+} from '../lib/calibration';
+import {
+  projectExplainForPublic,
+  projectHitRateForPublic,
+  projectHitRateRollupForPublic,
+  projectStrategyPnlForPublic,
+  projectTodayPicksForFree,
+  projectTodayPicksForPublic,
+  projectTopPicksForPublic,
+} from '../lib/public-today-picks';
+import { freezeMeetingPayload } from '../lib/prediction-lock-db';
+import { countPredictionLogRows, getMeetingLockState, isCancelledMeeting, LOCK_LEAD_MINUTES, lockCompletionAllowed, loggedRaceNumbers, markLockCompletion } from '../lib/lock-window';
+import { postLockRaceNumbers } from '../lib/freeze-ledger';
+import { computeFreezeLedger } from '../lib/freeze-ledger';
+
+import {
+  ADMIN_AUTH_POLICY,
+  hasAdminAccess,
+} from '../lib/admin-auth';
+
+export const analyzeRoutes = new Hono<{ Bindings: Env }>();
+
+function privateRouteUnavailable(c: any) {
+  return c.json({ error: 'Not found' }, 404);
+}
+
+async function raceHasSettledResults(db: D1Database, raceId: string): Promise<boolean> {
+  const row = await db.prepare(
+    `SELECT 1 AS ok FROM race_results
+     WHERE race_id=? AND finishing_position > 0 LIMIT 1`,
+  ).bind(raceId).first<{ ok: number }>().catch(() => null);
+  return row?.ok === 1;
+}
+
+async function publicMayReadRace(
+  db: D1Database,
+  race: { id: string; meeting_id: string; race_number: number },
+): Promise<boolean> {
+  if (await raceHasSettledResults(db, race.id)) return true;
+  const firstRace = await db.prepare(
+    `SELECT MIN(race_number) AS n FROM races WHERE meeting_id=?`,
+  ).bind(race.meeting_id).first<{ n: number | null }>().catch(() => null);
+  return Number(race.race_number) === Number(firstRace?.n);
+}
+
+async function raceDayReportIsSettled(db: D1Database, value: any): Promise<boolean> {
+  const races = Array.isArray(value?.races) ? value.races : [];
+  const raceIds = races.map((race: any) => race?.raceId)
+    .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0);
+  if (!races.length || raceIds.length !== races.length) return false;
+  const placeholders = raceIds.map(() => '?').join(',');
+  const { results } = await db.prepare(
+    `SELECT DISTINCT race_id FROM race_results
+     WHERE finishing_position > 0 AND race_id IN (${placeholders})`,
+  ).bind(...raceIds).all<{ race_id: string }>().catch(() => ({ results: [] as { race_id: string }[] }));
+  return new Set((results ?? []).map((row) => row.race_id)).size === raceIds.length;
+}
+  // ── Hit-rate cache (cron-driven) ────────────────────────────────────
+  // Past-meeting hit-rate is computed once by the daily cron in src/index.ts
+  // and stored here so the admin page can render instantly without hammering
+  // the API on every visit. /api/analyze/hit-rate reads cache first; pass
+  // ?refresh=1 to force a recompute.
+  export async function ensureHitRateCacheTable(db: D1Database): Promise<void> {
+    await db.prepare(
+      `CREATE TABLE IF NOT EXISTS meeting_hit_rate_cache (
+         date TEXT NOT NULL,
+         engine TEXT NOT NULL DEFAULT 'v12',
+         venue TEXT,
+         races_evaluated INTEGER,
+         top1_hits INTEGER,
+         top3_any_hits INTEGER,
+         top3_sum_intersect INTEGER,
+         top1_hit_rate REAL,
+         top3_any_hit_rate REAL,
+         top3_avg_intersect REAL,
+         payload_json TEXT NOT NULL,
+         computed_at TEXT NOT NULL,
+         PRIMARY KEY (date, engine)
+       )`
+    ).run();
+  }
+
+  // P0 architect fix 2026-05-21: cache version tag invalidates pre-ensemble
+  // rows so admin doesn't serve stale ELO-only payloads as if they were
+  // TX-Oracle v3 ensemble results. Bumping this constant is a one-shot evict.
+  const HIT_RATE_CACHE_VERSION = 'tx3';
+  function _engineKey(engine: string): string {
+    return `${engine}-${HIT_RATE_CACHE_VERSION}`;
+  }
+  export function hitRateEngineKey(engine: string): string {
+    return _engineKey(engine);
+  }
+
+  // Box-bet payouts for the model top-4 are scraped LIVE from the official HKJC
+  // results page on each compute, so payouts are available for ALL dates incl.
+  // historical (the D1 dividend history was comma-truncated garbage). One fetch per
+  // race; only when computeHitRateStats is called with { boxPayouts: true } (single-
+  // meeting route + cron) so the rollup / α-tuner never fire a fetch storm.
+  // One winning combination of a box pool: the horse numbers in it + its $10
+  // dividend. Dead-heat races pay >1 combo per pool, hence an array per pool.
+  type BoxCombo = { nums: string[]; div: number };
+  async function fetchHkjcBoxDivs(
+    date: string,
+    venue: string,
+    raceNumbers: number[],
+  ): Promise<{ byRace: Map<number, Record<string, BoxCombo[]>>; complete: boolean }> {
+    const byRace = new Map<number, Record<string, BoxCombo[]>>();
+    if (venue !== 'HV' && venue !== 'ST') return { byRace, complete: false };
+    if (!raceNumbers.length) return { byRace, complete: true };
+    const racedate = date.replace(/-/g, '/');
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+    const settledOk = await Promise.allSettled(raceNumbers.map(async (rn) => {
+      const url = `https://racing.hkjc.com/zh-hk/local/information/localresults?racedate=${racedate}&Racecourse=${venue}&RaceNo=${rn}`;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10000);
+      try {
+        const resp = await fetch(url, { headers: { 'user-agent': UA, 'accept-language': 'zh-HK,zh;q=0.9', 'accept': 'text/html' }, signal: ctrl.signal });
+        if (!resp.ok) return { rn, ok: false };
+        const body = await resp.text();
+        const settled = body.includes('勝出組合');
+        // Parse EVERY winning combination (dead-heat pools pay multiple) and
+        // group by box-pool code; the per-combo coverage is resolved below.
+        const divs: Record<string, BoxCombo[]> = {};
+        for (const row of parseHkjcDividends(body)) {
+          const pool = BOX_POOL_MAP[row.poolZh];
+          if (!pool) continue;
+          const nums = row.combination.split(',').map((s) => s.trim()).filter(Boolean);
+          if (!nums.length) continue;
+          if (!divs[pool]) divs[pool] = [];
+          divs[pool].push({ nums, div: row.dividend });
+        }
+        if (Object.keys(divs).length) byRace.set(rn, divs);
+        return { rn, ok: settled };
+      } finally {
+        clearTimeout(timer);
+      }
+    }));
+    let okCount = 0;
+    for (const r of settledOk) { if (r.status === 'fulfilled' && r.value.ok) okCount++; }
+    return { byRace, complete: okCount === raceNumbers.length };
+  }
+
+  // The pre-compute cron / rollup can write a hit-rate cache WITHOUT box payouts
+  // (boxDivsFetched=false). Recompute once so the first real view scrapes HKJC and
+  // fills payouts (全自動, no manual ?refresh=1). The flag flips to true after one
+  // fetch attempt, so this never loops even if HKJC is briefly unreachable.
+  function hitRateCacheNeedsBoxRecompute(cached: any): boolean {
+    const s = cached && cached.summary;
+    if (!s) return false;
+    if (s.boxDivsFetched !== true) return true; // legacy/rollup cache without payouts -> fill once
+    if (s.boxDivsComplete === true) return false;
+    // a needed dividend fetch failed (e.g. HKJC briefly down) -> bounded retry, not a tight loop
+    const at = cached.cachedAt ? Date.parse(cached.cachedAt) : NaN;
+    return isFinite(at) && (Date.now() - at) > 6 * 3600 * 1000;
+  }
+
+  // Caches written before the frozen-alpha accountability change carry no
+  // per-race scoreSource, so 預測與賽果 cannot label which model version was
+  // actually frozen. Treat those as stale once, so the next view self-heals.
+  function hitRateCacheNeedsSourceRecompute(cached: any): boolean {
+    const races = cached && Array.isArray(cached.races) ? cached.races : null;
+    if (!races || !races.length) return false;
+    return races.some((r: any) => r && r.scoreSource == null);
+  }
+
+  // 命中率補件自動重算：已評場數 < 有齊頭 4 名次場數，或賽果筆數多過上次快取，就重算。
+  // 只重算對帳，唔改凍結四揀／α。race_results 冇 updated_at，所以用筆數做代理。
+  async function meetingResultCounts(db: D1Database, date: string): Promise<{ rows: number; top4Races: number }> {
+    const row = await db.prepare(
+      `SELECT COUNT(*) AS rows_n,
+              (SELECT COUNT(*) FROM (SELECT r2.id FROM race_meetings m2 JOIN races r2 ON r2.meeting_id=m2.id
+                 JOIN race_results rr2 ON rr2.race_id=r2.id
+                WHERE m2.date=? AND rr2.finishing_position BETWEEN 1 AND 4
+                GROUP BY r2.id HAVING COUNT(DISTINCT rr2.finishing_position)=4)) AS top4_races
+         FROM race_meetings m JOIN races r ON r.meeting_id=m.id JOIN race_results rr ON rr.race_id=r.id
+        WHERE m.date=? AND rr.finishing_position > 0`
+    ).bind(date, date).first<{ rows_n: number; top4_races: number }>();
+    return { rows: Number(row?.rows_n ?? 0), top4Races: Number(row?.top4_races ?? 0) };
+  }
+
+  export async function hitRateCacheBehindResults(db: D1Database, date: string, cached: any): Promise<boolean> {
+    try {
+      const s = cached && cached.summary;
+      if (!s) return false;
+      const c = await meetingResultCounts(db, date);
+      const evaluated = Number(s.racesEvaluated ?? 0);
+      if (evaluated < c.top4Races) return true;
+      if (typeof s.resultRows === 'number' && c.rows > s.resultRows) return true;
+      return false;
+    } catch { return false; }
+  }
+
+  export async function readHitRateCache(db: D1Database, date: string, engine: string): Promise<any | null> {
+    try {
+      const row = await db.prepare(
+        `SELECT payload_json, computed_at FROM meeting_hit_rate_cache WHERE date=? AND engine=?`
+      ).bind(date, _engineKey(engine)).first<{ payload_json: string; computed_at: string }>();
+      if (!row?.payload_json) return null;
+      const parsed = JSON.parse(row.payload_json);
+      parsed.cachedAt = row.computed_at;
+      return parsed;
+    } catch { return null; }
+  }
+
+  export async function writeHitRateCache(db: D1Database, date: string, engine: string, payload: any): Promise<void> {
+    const s = { ...(payload.summary || {}) };
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      try { s.resultRows = (await meetingResultCounts(db, date)).rows; } catch {}
+    }
+    await db.prepare(
+      `INSERT OR REPLACE INTO meeting_hit_rate_cache
+         (date, engine, venue, races_evaluated, top1_hits, top3_any_hits, top3_sum_intersect,
+          top1_hit_rate, top3_any_hit_rate, top3_avg_intersect, payload_json, computed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      date, _engineKey(engine), payload.meeting?.venue ?? null,
+      s.racesEvaluated ?? null, s.top1Hits ?? null, s.top3AnyHits ?? null, s.top3SumIntersect ?? null,
+      s.top1HitRate ?? null, s.top3AnyHitRate ?? null, s.top3AvgIntersect ?? null,
+      JSON.stringify({ summary: s, races: payload.races, meeting: payload.meeting }),
+      new Date().toISOString(),
+    ).run();
+  }
+
+  // ── Shared strategy-pnl aggregation (GET handler + cron warm + admin) ──
+  // Bulk-reads EVERY real-date hit-rate cache in range in ONE query (no
+  // per-day round-trips), folds in every day that already has box payouts
+  // (summary.boxDivsFetched===true), and only ATTEMPTS an HKJC box fill — and
+  // only counts a day as recent-"pending" — inside a recent window. Ancient
+  // box-less days are counted as skippedMissingBoxData and NEVER block caching
+  // (they have no fetchable box dividend, so on-demand loads must not burn a
+  // ~15s scrape on them). Writes __strategy_pnl_<from> unless opts.write===false.
+  // The engine still ignores odds; this is the strategy-pnl read/record path.
+  export async function computeStrategyPnl(
+    db: D1Database,
+    engine: EloEngine,
+    opts?: { from?: string; fillBudget?: number; deadlineMs?: number; recentWindowDays?: number; write?: boolean },
+  ): Promise<any> {
+    const today = new Date().toISOString().substring(0, 10);
+    const engKey = _engineKey(engine);
+    let from = opts?.from || '';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      // Stats start at the FIRST HK race day of June 2026 onward; pre-June
+      // history is intentionally excluded (product decision). Resolve the floor
+      // to the first settled ST/HV meeting so points[0] is a real race day.
+      const STRATEGY_PNL_ANCHOR = '2026-06-01';
+      const fb = await db.prepare(
+        "SELECT MIN(m.date) AS d FROM race_meetings m WHERE m.venue IN ('ST','HV') AND m.date >= ?" +
+        " AND EXISTS (SELECT 1 FROM races r JOIN race_results rr ON rr.race_id=r.id WHERE r.meeting_id=m.id AND rr.finishing_position>0)",
+      ).bind(STRATEGY_PNL_ANCHOR).first<{ d: string | null }>().catch(() => null);
+      from = fb?.d || STRATEGY_PNL_ANCHOR;
+    }
+    const FILL_BUDGET = opts?.fillBudget ?? 1;
+    const FILL_DEADLINE_MS = opts?.deadlineMs ?? 15000;
+    const RECENT_WINDOW_DAYS = opts?.recentWindowDays ?? 21;
+    const recentCutoff = new Date(Date.now() - RECENT_WINDOW_DAYS * 86400000).toISOString().substring(0, 10);
+
+    const datesQ = await db.prepare(
+      "SELECT DISTINCT m.date AS date, m.venue AS venue FROM race_meetings m" +
+      " WHERE m.date >= ? AND m.venue IN ('ST','HV')" +
+      " AND EXISTS (SELECT 1 FROM races r JOIN race_results rr ON rr.race_id=r.id WHERE r.meeting_id=m.id AND rr.finishing_position>0)" +
+      " ORDER BY m.date ASC",
+    ).bind(from).all<any>().catch(() => ({ results: [] as any[] }));
+    const dayRows: any[] = (datesQ.results as any[]) || [];
+
+    // BULK READ: one query for every real-date hit-rate cache in range -> Map.
+    const cacheMap = new Map<string, any>();
+    try {
+      const cq = await db.prepare(
+        "SELECT date, payload_json, computed_at FROM meeting_hit_rate_cache WHERE engine=? AND date>=? AND date LIKE '____-__-__'",
+      ).bind(engKey, from).all<{ date: string; payload_json: string; computed_at: string }>();
+      for (const r of (((cq as any).results as any[]) || [])) {
+        try { const p = JSON.parse(r.payload_json); p.cachedAt = r.computed_at; cacheMap.set(r.date, p); } catch { /* treat as miss */ }
+      }
+    } catch { /* leave map empty -> days fall to fill/skip path */ }
+
+    const COST_FF = 10, COST_TRIO = 40, COST_TIERCE = 240, COST_QUARTET = 240;
+    const PER_RACE = COST_FF + COST_TRIO + COST_TIERCE + COST_QUARTET; // 530
+    const poolCost: Record<string, number> = { FF: COST_FF, TRIO: COST_TRIO, TIERCE: COST_TIERCE, QUARTET: COST_QUARTET };
+    const tStart = Date.now();
+    let fillsUsed = 0, pendingRecent = 0, skippedMissingBoxData = 0, cum = 0;
+    const points: any[] = [];
+    const pools: Record<string, { cost: number; payout: number; net: number; wins: number; bets: number }> = {
+      FF: { cost: 0, payout: 0, net: 0, wins: 0, bets: 0 },
+      TRIO: { cost: 0, payout: 0, net: 0, wins: 0, bets: 0 },
+      TIERCE: { cost: 0, payout: 0, net: 0, wins: 0, bets: 0 },
+      QUARTET: { cost: 0, payout: 0, net: 0, wins: 0, bets: 0 },
+    };
+    let totalCost = 0, totalPayout = 0, totalRacesBet = 0, daysEvaluated = 0;
+
+    for (const d of dayRows) {
+      let cached: any = cacheMap.get(d.date) || null;
+      let ok = !!(cached && cached.summary && cached.summary.boxDivsFetched === true);
+      if (!ok) {
+        const isRecent = d.date >= recentCutoff;
+        if (isRecent && fillsUsed < FILL_BUDGET && (Date.now() - tStart) < FILL_DEADLINE_MS) {
+          fillsUsed++;
+          try {
+            const computed = await computeHitRateStats(db, d.date, engine, undefined, { boxPayouts: true });
+            if (!('error' in computed)) {
+              await writeHitRateCache(db, d.date, engine, computed).catch(() => {});
+              cached = computed;
+              ok = !!(cached.summary && cached.summary.boxDivsFetched === true);
+            }
+          } catch (e) { /* leave unfilled */ }
+        }
+        if (!ok) {
+          if (isRecent) pendingRecent++; else skippedMissingBoxData++;
+          continue; // don't fold a day without box payouts into the line
+        }
+      }
+      let dayCost = 0, dayPayout = 0, racesBet = 0;
+      const dp: Record<string, { payout: number; wins: number }> = {
+        FF: { payout: 0, wins: 0 }, TRIO: { payout: 0, wins: 0 }, TIERCE: { payout: 0, wins: 0 }, QUARTET: { payout: 0, wins: 0 },
+      };
+      for (const race of (cached.races || [])) {
+        const a3 = Array.isArray(race.actualTop3) ? race.actualTop3.length : 0;
+        const a4 = Array.isArray(race.actualTop4) ? race.actualTop4.length : 0;
+        const settled = a3 >= 3 || a4 >= 3;
+        const m4 = (race.predictedTop4 || []).map((p: any) => p.horseNumber).filter((v: any) => v != null && v !== '').map((v: any) => String(v));
+        if (!settled || new Set(m4).size !== 4) continue;
+        racesBet++;
+        dayCost += PER_RACE;
+        for (const k of ['FF', 'TRIO', 'TIERCE', 'QUARTET']) { pools[k].cost += poolCost[k]; pools[k].bets++; }
+        for (const bp of (race.boxPayouts || [])) {
+          if (!dp[bp.pool]) continue;
+          const div = Number(bp.dividend) || 0;
+          dayPayout += div; dp[bp.pool].payout += div; dp[bp.pool].wins += 1;
+        }
+      }
+      if (!racesBet) continue;
+      const dayNet = dayPayout - dayCost;
+      cum += dayNet;
+      totalCost += dayCost; totalPayout += dayPayout; totalRacesBet += racesBet; daysEvaluated++;
+      for (const k of ['FF', 'TRIO', 'TIERCE', 'QUARTET']) { pools[k].payout += dp[k].payout; pools[k].wins += dp[k].wins; }
+      points.push({ date: d.date, venue: d.venue, racesBet, cost: dayCost, payout: dayPayout, net: dayNet, cum });
+    }
+    for (const k of ['FF', 'TRIO', 'TIERCE', 'QUARTET']) pools[k].net = pools[k].payout - pools[k].cost;
+    const totalNet = totalPayout - totalCost;
+    const roiPct = totalCost ? Math.round((totalNet / totalCost) * 1000) / 10 : null;
+    const payload: any = {
+      engine, from, to: today,
+      startBankroll: 0, unit: 10, perRaceCost: PER_RACE,
+      poolDefs: [
+        { pool: 'FF', name: '四連環（任序首4）', units: 1, cost: COST_FF },
+        { pool: 'TRIO', name: '單T（任序首3）', units: 4, cost: COST_TRIO },
+        { pool: 'TIERCE', name: '三重彩（依序首3）', units: 24, cost: COST_TIERCE },
+        { pool: 'QUARTET', name: '四重彩（依序首4）', units: 24, cost: COST_QUARTET },
+      ],
+      daysFound: dayRows.length, daysEvaluated, racesBet: totalRacesBet,
+      totalCost, totalPayout, totalNet, roiPct, cumNet: cum,
+      poolBreakdown: pools, points,
+      pending: pendingRecent,
+      pendingRecent, skippedMissingBoxData,
+      cacheComplete: pendingRecent === 0,
+      generatedAt: new Date().toISOString(),
+    };
+    if (opts?.write !== false) {
+      try {
+        await db.prepare("INSERT OR REPLACE INTO meeting_hit_rate_cache (date, engine, payload_json, computed_at) VALUES (?, ?, ?, ?)")
+          .bind(`__strategy_pnl_${from}`, `${engKey}-pnl`, JSON.stringify(payload), new Date().toISOString()).run();
+      } catch (e) { console.warn('strategy-pnl cache write failed', e); }
+    }
+    return payload;
+  }
+
+  // === Per-α hit-rate cache (P3-C+ tuner accelerator) ====================
+  // /api/analyze/hit-rate?alpha=N bypasses the default cache so the offline
+  // tuner can probe arbitrary α values, but rapid sweeps across many dates
+  // were tripping Cloudflare 503s. This dedicated table caches results keyed
+  // by (date, engine_versioned, alpha_x100) so each (date, α) is computed at
+  // most once. Cleared automatically when HIT_RATE_CACHE_VERSION bumps.
+  export async function ensureHitRateAlphaCacheTable(db: D1Database): Promise<void> {
+    await db.prepare(
+      `CREATE TABLE IF NOT EXISTS meeting_hit_rate_alpha_cache (
+         date TEXT NOT NULL,
+         engine TEXT NOT NULL,
+         alpha_x100 INTEGER NOT NULL,
+         payload_json TEXT NOT NULL,
+         computed_at TEXT NOT NULL,
+         PRIMARY KEY (date, engine, alpha_x100)
+       )`
+    ).run();
+  }
+  function _alphaKey(alpha: number): number { return Math.round(alpha * 100); }
+  export async function readHitRateAlphaCache(db: D1Database, date: string, engine: string, alpha: number): Promise<any | null> {
+    try {
+      const row = await db.prepare(
+        `SELECT payload_json, computed_at FROM meeting_hit_rate_alpha_cache WHERE date=? AND engine=? AND alpha_x100=?`
+      ).bind(date, _engineKey(engine), _alphaKey(alpha)).first<{ payload_json: string; computed_at: string }>();
+      if (!row?.payload_json) return null;
+      const parsed = JSON.parse(row.payload_json);
+      parsed.cachedAt = row.computed_at;
+      return parsed;
+    } catch { return null; }
+  }
+  export async function writeHitRateAlphaCache(db: D1Database, date: string, engine: string, alpha: number, payload: any): Promise<void> {
+    await db.prepare(
+      `INSERT OR REPLACE INTO meeting_hit_rate_alpha_cache (date, engine, alpha_x100, payload_json, computed_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      date, _engineKey(engine), _alphaKey(alpha),
+      JSON.stringify({ summary: payload.summary, races: payload.races, meeting: payload.meeting }),
+      new Date().toISOString(),
+    ).run();
+  }
+
+  // === Race-day report cache (Stage 8: scheduled pre-compute) ===========
+  // Avoids running the full today-picks compute on every admin page hit.
+  // Rebuilt by cron triggers in src/index.ts at HKT 06:00 / 11:00 / 18:00.
+  export async function ensureRaceDayReportCacheTable(db: D1Database): Promise<void> {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS race_day_report_cache (
+      date TEXT NOT NULL,
+      engine TEXT NOT NULL DEFAULT 'v12',
+      venue TEXT,
+      payload_json TEXT NOT NULL,
+      generated_at TEXT NOT NULL,
+      compute_ms INTEGER,
+      PRIMARY KEY (date, engine)
+    )`).run();
+  }
+
+  export async function readRaceDayReportCache(db: D1Database, date: string, engine: string): Promise<any | null> {
+    try {
+      await ensureRaceDayReportCacheTable(db);
+      const r = await db.prepare(
+        `SELECT payload_json, generated_at, compute_ms FROM race_day_report_cache WHERE date = ? AND engine = ?`
+      ).bind(date, engine).first<any>().catch(() => null);
+      if (!r?.payload_json) return null;
+      const p = JSON.parse(r.payload_json);
+      p.cachedGeneratedAt = r.generated_at;
+      p.cachedComputeMs = r.compute_ms;
+      p.fromCache = true;
+      return p;
+    } catch { return null; }
+  }
+
+  // ── FREEZE GUARD (PREDICTION VS RESULT accountability) ─────────────────
+  // True once an HK (ST/HV) race day's races have actual finishing positions.
+  // The race-day prediction (what was bettable when the user placed bets) must
+  // be IMMUTABLE. Otherwise the daily refresh cron — or even a /picks-by-date
+  // page-view, which calls runRaceDayReportCompute and FALLS BACK to MAX(date)
+  // when no upcoming meeting exists — recomputes the past meeting with drifted
+  // ELO/entries and silently overwrites prediction_log + race_day_report_cache
+  // (this is how 2026-06-21 R9's 11-3-5-7 became 4-3-10-11). writePredictionLog
+  // and writeRaceDayReportCache freeze (skip the write) when this is true.
+  // HK-only (venue ST/HV, finishing_position > 0) so a same-date overseas /
+  // simulcast / ghost result row can NEVER falsely freeze a live HK card. Fails
+  // OPEN (false on error) so a transient read failure never blocks a legit
+  // pre-race write; post-race the underlying query is stable so freeze is firm.
+  export async function dateHasSettledResults(db: D1Database, date: string | null | undefined, venue?: string | null): Promise<boolean> {
+    if (!date) return false;
+    const hk = (venue === 'ST' || venue === 'HV') ? venue : null;
+    try {
+      let row: unknown;
+      if (hk) {
+        row = await db.prepare(
+          `SELECT 1 AS x FROM race_meetings m
+             JOIN races r ON r.meeting_id = m.id
+             JOIN race_results rr ON rr.race_id = r.id
+            WHERE m.date = ? AND m.venue = ? AND rr.finishing_position > 0
+            LIMIT 1`
+        ).bind(date, hk).first().catch(() => null);
+      } else {
+        row = await db.prepare(
+          `SELECT 1 AS x FROM race_meetings m
+             JOIN races r ON r.meeting_id = m.id
+             JOIN race_results rr ON rr.race_id = r.id
+            WHERE m.date = ? AND m.venue IN ('ST','HV') AND rr.finishing_position > 0
+            LIMIT 1`
+        ).bind(date).first().catch(() => null);
+      }
+      return !!row;
+    } catch {
+      return false;
+    }
+  }
+
+  // ── T−1.5h WRITE GUARD ───────────────────────────────────────────────
+  // Approved spec: the full day's Top-4 locks 90 minutes before the FIRST
+  // race's post time. Once locked (or once results are in) prediction columns
+  // are immutable; the only remaining write is the result join.
+  // Before the lock instant we still allow refreshes (draft / 初版).
+  // Edge case: if the lock moment arrives and NO snapshot exists yet, we allow
+  // exactly one write so the day gets a frozen snapshot instead of nothing.
+  export async function predictionWritesAreFrozen(
+    db: D1Database,
+    date: string | null | undefined,
+    venue: string | null | undefined,
+    engine: string = 'v12',
+  ): Promise<{ frozen: boolean; reason: string; lockAt: string | null }> {
+    if (!date) return { frozen: false, reason: 'no-date', lockAt: null };
+    if (isCancelledMeeting(date)) return { frozen: true, reason: 'cancelled', lockAt: null };
+    const settled = await dateHasSettledResults(db, date, venue);
+    const lock = await getMeetingLockState(db, date, venue, { settled });
+    if (settled) return { frozen: true, reason: 'settled', lockAt: lock.lockAt };
+    if (!lock.locked) return { frozen: false, reason: 'pre-lock', lockAt: lock.lockAt };
+    const rows = await countPredictionLogRows(db, date, engine);
+    if (rows > 0) {
+      // T−90 補寫一次：鎖點到咗但全日快照未齊（例如 2026-09-27 只得第 1 場），
+      // 首場開跑前准寫「一次」缺咗嘅場次；已有場次永不覆寫，已過賽日永不補寫。
+      if (await lockCompletionAllowed(db, date, venue, engine)) {
+        return { frozen: false, reason: 'locked-completion', lockAt: lock.lockAt };
+      }
+      return { frozen: true, reason: `locked-T-${LOCK_LEAD_MINUTES}m`, lockAt: lock.lockAt };
+    }
+    return { frozen: false, reason: 'locked-first-snapshot', lockAt: lock.lockAt };
+  }
+
+  export async function writeRaceDayReportCache(db: D1Database, date: string, engine: string, venue: string | null, payload: any, computeMs: number): Promise<void> {
+    // FREEZE GUARD: never overwrite a locked (T−1.5h) or settled HK race day.
+    const _g = await predictionWritesAreFrozen(db, date, venue);
+    if (_g.frozen || _g.reason === 'locked-completion') return;
+    await ensureRaceDayReportCacheTable(db);
+    await db.prepare(
+      `INSERT INTO race_day_report_cache (date, engine, venue, payload_json, generated_at, compute_ms)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(date, engine) DO UPDATE SET
+         venue = excluded.venue,
+         payload_json = excluded.payload_json,
+         generated_at = excluded.generated_at,
+         compute_ms = excluded.compute_ms`
+    ).bind(date, engine, venue, JSON.stringify(payload), new Date().toISOString(), computeMs).run();
+  }
+
+  // === Prediction log (Phase A · 回測底盤) ==============================
+  // Stores every per-horse prediction so we can compare against actual results.
+  // variant: 'baseline' (TX-Oracle v3 ensemble) | future...
+  // Composite key (date, race_number, horse_id, engine, variant) → INSERT OR REPLACE on re-run.
+  export async function ensurePredictionLogTable(db: D1Database): Promise<void> {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS prediction_log (
+      date TEXT NOT NULL,
+      race_number INTEGER NOT NULL,
+      horse_id TEXT NOT NULL,
+      engine TEXT NOT NULL DEFAULT 'v12',
+      variant TEXT NOT NULL DEFAULT 'baseline',
+      horse_number INTEGER,
+      draw INTEGER,
+      horse_elo REAL,
+      elo_source TEXT,
+      elo_confidence REAL,
+      elo_composite REAL,
+      factor_bonus REAL,
+      final_score REAL,
+      p_win REAL,
+      p_top3 REAL,
+      predicted_rank INTEGER,
+      actual_finish INTEGER,
+      actual_win_odds REAL,
+      is_hit_top1 INTEGER,
+      is_hit_top3 INTEGER,
+      is_hit_top4 INTEGER,
+      generated_at TEXT NOT NULL,
+      joined_at TEXT,
+      lgb_score REAL,
+      lgb_model_version TEXT,
+      score_source TEXT,
+      PRIMARY KEY (date, race_number, horse_id, engine, variant)
+    )`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_prediction_log_date ON prediction_log(date)`).run().catch(() => {});
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_prediction_log_join ON prediction_log(date, joined_at)`).run().catch(() => {});
+  }
+
+  // Write all per-horse rows for a single race-day report payload. Idempotent.
+  export async function writePredictionLog(db: D1Database, payload: any, variant: string = 'baseline'): Promise<{ rows: number; frozen?: boolean; lockReason?: string; lockAt?: string | null }> {
+    if (!payload?.date || !Array.isArray(payload?.races)) return { rows: 0 };
+    // FREEZE GUARD: once the HK race day has results, the bettable prediction is
+    // immutable — never let a post-race recompute overwrite it.
+    const _guard = await predictionWritesAreFrozen(db, payload.date, payload.venue, payload.eloEngine ?? 'v12');
+    if (_guard.frozen) return { rows: 0, frozen: true, lockReason: _guard.reason, lockAt: _guard.lockAt } as any;
+    await ensurePredictionLogTable(db);
+    const engine = payload.eloEngine ?? 'v12';
+    const generatedAt = payload.generatedAt ?? new Date().toISOString();
+    const completion = _guard.reason === 'locked-completion';
+    const alreadyLogged = completion ? await loggedRaceNumbers(db, payload.date, engine) : new Set<number>();
+    const stmts: D1PreparedStatement[] = [];
+    for (const race of payload.races) {
+      if (!race?.picks?.length || race.raceNumber == null || race.raceNumber === 0) continue;
+      if (completion && alreadyLogged.has(Number(race.raceNumber))) continue; // 已鎖場次永不覆寫
+      for (const p of race.picks) {
+        if (!p.horseId) continue;
+        stmts.push(
+          db.prepare(`${completion ? 'INSERT OR IGNORE' : 'INSERT OR REPLACE'} INTO prediction_log
+            (date, race_number, horse_id, engine, variant, horse_number, draw,
+             horse_elo, elo_source, elo_confidence, elo_composite, factor_bonus, final_score,
+             p_win, p_top3, predicted_rank, generated_at,
+             lgb_score, lgb_model_version, score_source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+            payload.date, race.raceNumber, p.horseId, engine, variant,
+            p.horseNumber ?? null, p.draw ?? null,
+            p.horseElo ?? null, p.eloSource ?? null, p.horseConfidence ?? null,
+            p.eloComposite ?? null, p.factorBonus ?? null, p.finalScore ?? null,
+            p.pWin ?? null, p.pTop3 ?? null, p.rank ?? null,
+            generatedAt,
+            p.lgbScore ?? null,
+            // Only attribute a model version when this pick was actually rescored by LGB.
+            // Without this gate, payload-level lgbModelVersion would leak onto
+            // partial-coverage rows whose scoreSource is not 'lgb', contaminating
+            // future engine-split reporting (architect review of c4b0fd1).
+            (p.scoreSource === 'lgb' || p.lgbScore != null)
+              ? (p.lgbModelVersion ?? payload.lgbModelVersion ?? null)
+              : null,
+            p.scoreSource ?? null
+          )
+        );
+      }
+    }
+    if (!stmts.length) return { rows: 0 };
+    // batch in chunks of 50 (D1 batch limit ~100)
+    for (let i = 0; i < stmts.length; i += 50) {
+      await db.batch(stmts.slice(i, i + 50));
+    }
+    if (completion) await markLockCompletion(db, payload.date, engine, stmts.length);
+    return { rows: stmts.length };
+  }
+
+  // Join predictions with actual race_results. Idempotent — only updates rows whose actual_finish IS NULL.
+  export async function joinPredictionResults(db: D1Database, date: string): Promise<{ updated: number; races: number }> {
+    await ensurePredictionLogTable(db);
+    // Pull all results for this date
+    const { results: actuals } = await db.prepare(
+      `SELECT r.race_number, rr.horse_id, rr.finishing_position, rr.win_odds
+       FROM race_meetings m
+       JOIN races r ON r.meeting_id = m.id
+       JOIN race_results rr ON rr.race_id = r.id
+       WHERE m.date = ? AND m.venue IN ('ST','HV') AND rr.finishing_position > 0`
+    ).bind(date).all<any>().catch(() => ({ results: [] as any[] }));
+    if (!actuals?.length) return { updated: 0, races: 0 };
+    const stmts: D1PreparedStatement[] = [];
+    const seenRaces = new Set<number>();
+    for (const a of actuals) {
+      seenRaces.add(a.race_number);
+      const finish = Number(a.finishing_position);
+      const top1 = finish === 1 ? 1 : 0;
+      const top3 = finish >= 1 && finish <= 3 ? 1 : 0;
+      const top4 = finish >= 1 && finish <= 4 ? 1 : 0;
+      stmts.push(
+        db.prepare(`UPDATE prediction_log
+          SET actual_finish = ?, actual_win_odds = ?, is_hit_top1 = ?, is_hit_top3 = ?, is_hit_top4 = ?, joined_at = ?
+          WHERE date = ? AND race_number = ? AND horse_id = ? AND actual_finish IS NULL`)
+          .bind(finish, a.win_odds ?? null, top1, top3, top4, new Date().toISOString(), date, a.race_number, a.horse_id)
+      );
+    }
+    let updated = 0;
+    for (let i = 0; i < stmts.length; i += 50) {
+      const res = await db.batch(stmts.slice(i, i + 50));
+      for (const r of res) updated += (r.meta?.changes ?? 0);
+    }
+    return { updated, races: seenRaces.size };
+  }
+
+  // Rolling N-day hit-rate / Brier / log-loss / calibration summary by variant.
+  // Calibration (reliability) bins compare the engine's stated win probability
+  // against the observed win frequency in that probability band. ECE is the
+  // sample-weighted mean absolute gap; slope/intercept come from a simple
+  // linear fit of observed vs stated, so 1.0 / 0.0 means well calibrated.
+  const CALIB_EDGES = [0, 0.02, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.5, 1];
+  function calibBinIndex(p: number): number {
+    for (let i = 0; i < CALIB_EDGES.length - 1; i++) {
+      if (p >= CALIB_EDGES[i]! && p < CALIB_EDGES[i + 1]!) return i;
+    }
+    return CALIB_EDGES.length - 2;
+  }
+  function emptyCalibBins() {
+    return CALIB_EDGES.slice(0, -1).map((lo, i) => ({
+      lo, hi: CALIB_EDGES[i + 1]!, n: 0, predSum: 0, wins: 0,
+    }));
+  }
+  function finishCalib(bins: ReturnType<typeof emptyCalibBins>) {
+    const total = bins.reduce((a, b) => a + b.n, 0);
+    let ece = 0, sxy = 0, sxx = 0, sx = 0, sy = 0, n = 0;
+    const out = bins.map((b) => {
+      const predAvg = b.n ? b.predSum / b.n : null;
+      const actual = b.n ? b.wins / b.n : null;
+      if (b.n && predAvg != null && actual != null) {
+        ece += (b.n / total) * Math.abs(actual - predAvg);
+        sx += predAvg * b.n; sy += actual * b.n;
+        sxy += predAvg * actual * b.n; sxx += predAvg * predAvg * b.n; n += b.n;
+      }
+      return {
+        lo: Math.round(b.lo * 1000) / 10,
+        hi: Math.round(b.hi * 1000) / 10,
+        n: b.n,
+        predictedPct: predAvg != null ? Math.round(predAvg * 1000) / 10 : null,
+        actualPct: actual != null ? Math.round(actual * 1000) / 10 : null,
+      };
+    });
+    let slope: number | null = null, intercept: number | null = null;
+    if (n > 0) {
+      const den = sxx - (sx * sx) / n;
+      if (Math.abs(den) > 1e-9) {
+        slope = (sxy - (sx * sy) / n) / den;
+        intercept = (sy - slope * sx) / n;
+      }
+    }
+    return {
+      bins: out,
+      samples: total,
+      ece: total ? Math.round(ece * 10000) / 10000 : null,
+      slope: slope != null ? Math.round(slope * 1000) / 1000 : null,
+      intercept: intercept != null ? Math.round(intercept * 10000) / 10000 : null,
+    };
+  }
+
+  export async function summarizePredictionAccuracy(db: D1Database, days: number = 30): Promise<any> {
+    await ensurePredictionLogTable(db);
+    const sinceDate = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+    const { results } = await db.prepare(
+      `SELECT date, race_number, variant, horse_id, p_win, p_top3, predicted_rank,
+              actual_finish, is_hit_top1, is_hit_top3, is_hit_top4
+       FROM prediction_log
+       WHERE date >= ? AND actual_finish IS NOT NULL
+       ORDER BY date DESC, race_number ASC`
+    ).bind(sinceDate).all<any>().catch(() => ({ results: [] as any[] }));
+    const byVariant: Record<string, any> = {};
+    const seenRaces = new Set<string>();
+    for (const r of (results ?? [])) {
+      const v = r.variant ?? 'baseline';
+      if (!byVariant[v]) byVariant[v] = {
+        variant: v, races: 0, horses: 0, top1Picks: 0, top1Hits: 0, top3Picks3: 0, top3Hits: 0,
+        brierWin: 0, brierWinN: 0, logLossWin: 0,
+        brierTop3: 0, brierTop3N: 0, logLossTop3: 0,
+        calibWin: emptyCalibBins(), calibTop3: emptyCalibBins(),
+        baseWins: 0,
+      };
+      const b = byVariant[v];
+      const raceKey = `${r.date}|${r.race_number}|${v}`;
+      if (!seenRaces.has(raceKey)) { seenRaces.add(raceKey); b.races++; }
+      b.horses++;
+      if (r.predicted_rank === 1) { b.top1Picks++; if (r.is_hit_top1) b.top1Hits++; }
+      if (r.predicted_rank != null && r.predicted_rank <= 3) { b.top3Picks3++; if (r.is_hit_top3) b.top3Hits++; }
+      if (r.p_win != null && r.is_hit_top1 != null) {
+        const y = r.is_hit_top1 ? 1 : 0;
+        const p = Math.min(0.999, Math.max(0.001, r.p_win));
+        b.brierWin += (p - y) * (p - y);
+        b.brierWinN++;
+        b.baseWins += y;
+        b.logLossWin += -(y * Math.log(p) + (1 - y) * Math.log(1 - p));
+        const bin = b.calibWin[calibBinIndex(p)];
+        bin.n++; bin.predSum += p; bin.wins += y;
+      }
+      if (r.p_top3 != null && r.is_hit_top3 != null) {
+        const y3 = r.is_hit_top3 ? 1 : 0;
+        const p3 = Math.min(0.999, Math.max(0.001, r.p_top3));
+        b.brierTop3 += (p3 - y3) * (p3 - y3);
+        b.brierTop3N++;
+        b.logLossTop3 += -(y3 * Math.log(p3) + (1 - y3) * Math.log(1 - p3));
+        const bin3 = b.calibTop3[calibBinIndex(p3)];
+        bin3.n++; bin3.predSum += p3; bin3.wins += y3;
+      }
+    }
+    const summary = Object.values(byVariant).map((b: any) => {
+      // Brier skill score vs the naive "everyone equally likely" baseline:
+      // positive means the engine's probabilities beat the base rate.
+      const baseRate = b.brierWinN ? b.baseWins / b.brierWinN : null;
+      const brierWin = b.brierWinN ? b.brierWin / b.brierWinN : null;
+      const brierRef = baseRate != null ? baseRate * (1 - baseRate) : null;
+      const skill = brierWin != null && brierRef != null && brierRef > 0
+        ? 1 - brierWin / brierRef : null;
+      return {
+        variant: b.variant,
+        races: b.races,
+        horses: b.horses,
+        bankerHitRate: b.top1Picks ? Math.round((b.top1Hits / b.top1Picks) * 1000) / 10 : null,
+        top3PickHitRate: b.top3Picks3 ? Math.round((b.top3Hits / b.top3Picks3) * 1000) / 10 : null,
+        brierWin: brierWin != null ? Math.round(brierWin * 10000) / 10000 : null,
+        logLossWin: b.brierWinN ? Math.round((b.logLossWin / b.brierWinN) * 10000) / 10000 : null,
+        brierTop3: b.brierTop3N ? Math.round((b.brierTop3 / b.brierTop3N) * 10000) / 10000 : null,
+        logLossTop3: b.brierTop3N ? Math.round((b.logLossTop3 / b.brierTop3N) * 10000) / 10000 : null,
+        baseWinRate: baseRate != null ? Math.round(baseRate * 1000) / 10 : null,
+        brierSkillScore: skill != null ? Math.round(skill * 1000) / 1000 : null,
+        calibrationWin: finishCalib(b.calibWin),
+        calibrationTop3: finishCalib(b.calibTop3),
+      };
+    });
+    return { sinceDate, days, summary };
+  }
+
+  // === Stage: residual diagnostics =====================================
+  // 按班次／路程／場地狀況／賠率區間／馬場分組，找出系統性偏差（殘差）。
+  // 只讀 prediction_log（已對賬、actual_finish 非空）＋ races 場次資料。
+  function distanceBand(d: number | null | undefined): string {
+    const v = Number(d);
+    if (!Number.isFinite(v) || v <= 0) return '未知';
+    if (v <= 1200) return '≤1200米';
+    if (v <= 1400) return '1201-1400米';
+    if (v <= 1600) return '1401-1600米';
+    if (v <= 1800) return '1601-1800米';
+    return '>1800米';
+  }
+  function oddsBand(o: number | null | undefined): string {
+    const v = Number(o);
+    if (!Number.isFinite(v) || v <= 0) return '無賠率';
+    if (v <= 3) return '≤3.0 熱門';
+    if (v <= 6) return '3.1-6.0';
+    if (v <= 12) return '6.1-12';
+    if (v <= 25) return '12.1-25';
+    return '>25 大冷';
+  }
+  function classBand(s: string | null | undefined): string {
+    const v = String(s ?? '').trim();
+    if (!v) return '未知';
+    if (/Group|G1|G2|G3|級/i.test(v)) return '分級賽';
+    if (/Griffin|新馬/i.test(v)) return '新馬賽';
+    const m = v.match(/[1-5]/);
+    return m ? `第${({ '1': '一', '2': '二', '3': '三', '4': '四', '5': '五' } as Record<string, string>)[m[0]]}班` : v.substring(0, 12);
+  }
+
+  export async function summarizeResiduals(db: D1Database, days: number = 365): Promise<any> {
+    await ensurePredictionLogTable(db);
+    const sinceDate = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+    const { results } = await db.prepare(
+      `SELECT pl.date, pl.race_number, pl.p_win, pl.p_top3, pl.predicted_rank,
+              pl.actual_finish, pl.actual_win_odds,
+              r.distance, r.going, r.class AS race_class, rm.venue
+       FROM prediction_log pl
+       JOIN race_meetings rm ON rm.date = pl.date AND rm.venue IN ('ST','HV')
+       JOIN races r ON r.meeting_id = rm.id AND r.race_number = pl.race_number
+       WHERE pl.date >= ? AND pl.actual_finish IS NOT NULL AND pl.variant = 'baseline'`
+    ).bind(sinceDate).all<any>().catch(() => ({ results: [] as any[] }));
+    const rows = results ?? [];
+
+    type Acc = {
+      key: string; horses: number; races: Set<string>;
+      predSum: number; predN: number; wins: number;
+      brier: number; brierN: number;
+      top1Picks: number; top1Hits: number;
+      top4Pred: number; top4Hits: number;
+      predTop3Sum: number; predTop3N: number; top3Actual: number;
+    };
+    const dims: Record<string, Map<string, Acc>> = {
+      class: new Map(), distance: new Map(), going: new Map(), oddsBand: new Map(), venue: new Map(),
+    };
+    const newAcc = (key: string): Acc => ({
+      key, horses: 0, races: new Set(), predSum: 0, predN: 0, wins: 0, brier: 0, brierN: 0,
+      top1Picks: 0, top1Hits: 0, top4Pred: 0, top4Hits: 0, predTop3Sum: 0, predTop3N: 0, top3Actual: 0,
+    });
+    const push = (dim: string, key: string, r: any) => {
+      const map = dims[dim]!;
+      if (!map.has(key)) map.set(key, newAcc(key));
+      const a = map.get(key)!;
+      a.horses++;
+      a.races.add(`${r.date}|${r.race_number}`);
+      const win = Number(r.actual_finish) === 1 ? 1 : 0;
+      const top3 = Number(r.actual_finish) <= 3 && Number(r.actual_finish) > 0 ? 1 : 0;
+      if (r.p_win != null) {
+        const p = Math.min(0.999, Math.max(0.001, Number(r.p_win)));
+        a.predSum += p; a.predN++; a.wins += win;
+        a.brier += (p - win) * (p - win); a.brierN++;
+      }
+      if (r.p_top3 != null) {
+        a.predTop3Sum += Math.min(0.999, Math.max(0.001, Number(r.p_top3)));
+        a.predTop3N++; a.top3Actual += top3;
+      }
+      if (Number(r.predicted_rank) === 1) { a.top1Picks++; if (win) a.top1Hits++; }
+      if (Number(r.predicted_rank) <= 4 && Number(r.predicted_rank) > 0) {
+        a.top4Pred++;
+        if (Number(r.actual_finish) <= 4 && Number(r.actual_finish) > 0) a.top4Hits++;
+      }
+    };
+    for (const r of rows) {
+      push('class', classBand(r.race_class), r);
+      push('distance', distanceBand(r.distance), r);
+      push('going', String(r.going ?? '未知').trim() || '未知', r);
+      push('oddsBand', oddsBand(r.actual_win_odds), r);
+      push('venue', r.venue === 'ST' ? '沙田' : r.venue === 'HV' ? '跑馬地' : '未知', r);
+    }
+    const r1 = (v: number) => Math.round(v * 1000) / 10;
+    const finish = (map: Map<string, Acc>) =>
+      Array.from(map.values())
+        .filter((a) => a.horses >= 10)
+        .map((a) => {
+          const pred = a.predN ? a.predSum / a.predN : null;
+          const actual = a.predN ? a.wins / a.predN : null;
+          const predT3 = a.predTop3N ? a.predTop3Sum / a.predTop3N : null;
+          const actT3 = a.predTop3N ? a.top3Actual / a.predTop3N : null;
+          const races = a.races.size;
+          return {
+            key: a.key,
+            horses: a.horses,
+            races,
+            predWinPct: pred != null ? r1(pred) : null,
+            actualWinPct: actual != null ? r1(actual) : null,
+            // 正數＝引擎低估（實際好過預測）；負數＝高估
+            biasWinPp: pred != null && actual != null ? Math.round((actual - pred) * 1000) / 10 : null,
+            predTop3Pct: predT3 != null ? r1(predT3) : null,
+            actualTop3Pct: actT3 != null ? r1(actT3) : null,
+            biasTop3Pp: predT3 != null && actT3 != null ? Math.round((actT3 - predT3) * 1000) / 10 : null,
+            brierWin: a.brierN ? Math.round((a.brier / a.brierN) * 10000) / 10000 : null,
+            bankerHitRate: a.top1Picks ? r1(a.top1Hits / a.top1Picks) : null,
+            top4AvgIntersect: races ? Math.round((a.top4Hits / races) * 100) / 100 : null,
+          };
+        })
+        .sort((x, y) => y.horses - x.horses);
+    const groups = {
+      class: finish(dims['class']!),
+      distance: finish(dims['distance']!),
+      going: finish(dims['going']!),
+      oddsBand: finish(dims['oddsBand']!),
+      venue: finish(dims['venue']!),
+    };
+    // 最大偏差（用 |biasTop3Pp| 排序，樣本 ≥ 60 匹先計）
+    const flagged = Object.entries(groups).flatMap(([dim, list]) =>
+      list.filter((g) => g.horses >= 60 && g.biasTop3Pp != null && Math.abs(g.biasTop3Pp) >= 5)
+        .map((g) => ({ dim, key: g.key, horses: g.horses, biasTop3Pp: g.biasTop3Pp, biasWinPp: g.biasWinPp })),
+    ).sort((a, b) => Math.abs(b.biasTop3Pp!) - Math.abs(a.biasTop3Pp!));
+    return { sinceDate, days, horses: rows.length, groups, flagged };
+  }
+
+
+
+  // === New-horse ELO seed (Stage 8 data-completeness fix) ==============
+  // When horse_elo_snapshots has no row (first-time runner / newly-imported),
+  // derive a baseline ELO from HKJC handicap rating, or class median if none.
+  // Marked with eloSource='rating-seed'|'class-seed' and lower confidence.
+  export function classBaselineRating(raceClass: string | null | undefined): number {
+    if (!raceClass) return 52;
+    const s = String(raceClass);
+    if (/Group\s*1|G1|一級|第一班/i.test(s)) return 105;
+    if (/Group\s*2|G2|二級|第二班/i.test(s)) return 95;
+    if (/Group\s*3|G3|三級|第三班/i.test(s)) return 85;
+    if (/Griffin|新馬/i.test(s)) return 52;
+    if (/第四班|Class\s*4/i.test(s)) return 55;
+    if (/第五班|Class\s*5/i.test(s)) return 45;
+    const m = s.match(/[1-5]/);
+    if (m) {
+      return ({ '1': 85, '2': 75, '3': 65, '4': 55, '5': 45 } as Record<string, number>)[m[0]] ?? 52;
+    }
+    return 52;
+  }
+
+  export function seedHorseElo(rating: number | string | null | undefined, raceClass: string | null | undefined): { rating: number; source: 'rating-seed' | 'class-seed'; confidence: number } {
+    let r: number | null = null;
+    if (typeof rating === 'string') { const p = parseInt(rating.trim(), 10); r = Number.isFinite(p) ? p : null; }
+    else if (typeof rating === 'number' && Number.isFinite(rating)) r = rating;
+    if (r != null && r > 0) {
+      return { rating: 1500 + (r - 60) * 8, source: 'rating-seed', confidence: 0.4 };
+    }
+    return { rating: 1500 + (classBaselineRating(raceClass) - 60) * 8, source: 'class-seed', confidence: 0.2 };
+  }
+  
+  
+// 共用 helper：將一隻 pick 轉為一句中文「點解揀佢」原因
+function buildPickReason(pick: any): string {
+  if (!pick) return '資料不全';
+  const parts: string[] = [];
+  if (pick.eloComposite != null) {
+    const elos: string[] = [];
+    if (pick.horseElo != null) elos.push(`馬${Math.round(pick.horseElo)}`);
+    if (pick.jockeyElo != null) elos.push(`騎${Math.round(pick.jockeyElo)}`);
+    if (pick.trainerElo != null) elos.push(`練${Math.round(pick.trainerElo)}`);
+    parts.push(`綜合ELO ${Math.round(pick.eloComposite)}` + (elos.length ? ` (${elos.join('·')})` : ''));
+  }
+  const fb = pick.factorBreakdown;
+  if (fb) {
+    const cand: { label: string; bonus: number }[] = [
+      { label: '途程', bonus: fb.distance?.bonus ?? 0 },
+      { label: '場地', bonus: fb.going?.bonus ?? 0 },
+      { label: '檔位', bonus: fb.draw?.bonus ?? 0 },
+      { label: '負磅', bonus: fb.weight?.bonus ?? 0 },
+      { label: '狀態', bonus: fb.condition?.bonus ?? 0 },
+      { label: '傷患', bonus: fb.injury?.bonus ?? 0 },
+      { label: '騎練', bonus: fb.jtCombo?.bonus ?? 0 },
+      { label: '恢復', bonus: fb.recency?.bonus ?? 0 },
+    ].filter(x => Math.abs(x.bonus) >= 1);
+    cand.sort((a, b) => Math.abs(b.bonus) - Math.abs(a.bonus));
+    const top = cand.slice(0, 3).map(f => `${f.label}${f.bonus >= 0 ? '+' : ''}${f.bonus.toFixed(0)}`);
+    if (top.length) parts.push(top.join(' '));
+  }
+  if (pick.pWin != null) parts.push(`勝率 ${(pick.pWin * 100).toFixed(1)}%`);
+  return parts.join(' · ') || '無因子數據';
+}
+
+  function buildPickNarrative(
+    p: any,
+    ctx: { distance?: number | null; going?: string | null; raceClass?: string | null; fieldSize?: number | null } = {},
+  ): string {
+    if (!p) return '';
+    const rankWord = p.rank === 1 ? '本場首選' : p.rank === 2 ? '次選' : p.rank === 3 ? '三選' : p.rank === 4 ? '四選' : `第 ${p.rank} 選`;
+    const pct = p.pWin != null ? `${(p.pWin * 100).toFixed(0)}%` : null;
+    const seg: string[] = [];
+
+    const hasLgb = typeof p.scoreSource === 'string' && p.scoreSource.indexOf('ensemble') >= 0 && p.lgbScore != null;
+    const aiGood = hasLgb && p.lgbScore > -2.2;
+    let lead = `系統將佢列為${rankWord}`;
+    if (pct) lead += `，綜合勝算約 ${pct}`;
+    if (hasLgb) lead += aiGood ? '；AI 機器學習與評分引擎雙雙看好' : '；評分引擎看好，AI 模型訊號偏弱';
+    else lead += '；以實力評分引擎為主';
+    seg.push(lead + '。');
+
+    const fb = p.factorBreakdown || {};
+    const bn = (k: string): number => (fb[k] && typeof fb[k].bonus === 'number') ? fb[k].bonus : 0;
+    const pos: string[] = [];
+    const neg: string[] = [];
+
+    if (bn('draw') >= 2) pos.push(`今仗檔位${p.draw != null ? `（${p.draw} 檔）` : ''}佔優`);
+    else if (bn('draw') <= -2) neg.push(`檔位${p.draw != null ? `（${p.draw} 檔）` : ''}稍為不利`);
+    if (bn('weight') >= 2) pos.push('磅位有利');
+    else if (bn('weight') <= -2) neg.push('負磅偏重');
+    if (bn('distance') >= 2) pos.push(`往績適合今仗${ctx.distance ? ` ${ctx.distance} 米` : ''}途程`);
+    else if (bn('distance') <= -2) neg.push('今仗距離未必最啱');
+    if (bn('going') >= 2) pos.push(`往績適應今日${ctx.going || ''}場地`);
+    else if (bn('going') <= -2) neg.push(`今日${ctx.going || ''}場地未必合適`);
+    if (bn('condition') >= 2) pos.push('近期晨操狀態理想');
+    if (bn('jtCombo') >= 2) pos.push('騎練配搭往績出色');
+    if (bn('injury') <= -2) neg.push('近期有傷患記錄需留意');
+
+    if (p.eloSource && p.eloSource !== 'snapshot') {
+      pos.push('新馬登場，評分屬潛力估算');
+    } else if (typeof p.daysSinceLast === 'number') {
+      const d = p.daysSinceLast;
+      if (d >= 14 && d <= 45) pos.push(`休息 ${d} 日復出，調整充分`);
+      else if (d > 90) neg.push(`久休 ${d} 日復出，臨場狀態待觀察`);
+      else if (d < 14 && d >= 0) pos.push(`${d} 日內再戰，狀態延續`);
+    }
+
+    if (p.eloComposite != null && p.eloComposite >= 1520) pos.push('實力評分高於全場平均');
+
+    if (pos.length) seg.push(`支持理由：${pos.slice(0, 4).join('、')}。`);
+    if (neg.length) seg.push(`需留意：${neg.slice(0, 2).join('、')}。`);
+
+    return seg.join('');
+  }
+
+// 共用 helper：批量載入指定賽事日所有場次的 LGB 預測分數
+// 被 computePicksFromEntries (hit-rate) 與 runRaceDayReportCompute (today-picks) 共用，
+// 防止兩條路徑 drift（曾經 hit-rate 冇 LGB 路徑 → admin 面板顯示純 ELO）。
+export async function loadLgbScoresForMeeting(
+  db: D1Database,
+  raceNumbers: number[],
+  racesDBMap: Map<number, any>,
+  targetDate: string,
+  venue: string,
+): Promise<{ map: Map<string, { score: number; pWin: number | null; modelVersion: string | null }>; modelVersion: string | null }> {
+  const map = new Map<string, { score: number; pWin: number | null; modelVersion: string | null }>();
+  let modelVersion: string | null = null;
+  try {
+    const synthRaceIds = raceNumbers
+      .filter(rn => rn > 0)
+      .map(rn => racesDBMap.get(rn)?.id ?? `race_${targetDate}_${venue}_${rn}`);
+    if (synthRaceIds.length) {
+      const ph = synthRaceIds.map(() => '?').join(',');
+      const { results: lgbRows } = await db.prepare(
+        `SELECT race_id, horse_id, lgb_score, p_win, model_version
+           FROM lgb_predictions WHERE race_id IN (${ph})`
+      ).bind(...synthRaceIds).all<any>().catch(() => ({ results: [] as any[] }));
+      for (const r of (lgbRows ?? [])) {
+        map.set(`${r.race_id}::${r.horse_id}`, {
+          score: Number(r.lgb_score),
+          pWin: r.p_win != null ? Number(r.p_win) : null,
+          modelVersion: r.model_version ?? null,
+        });
+        if (!modelVersion && r.model_version) modelVersion = r.model_version;
+      }
+    }
+  } catch { /* table may not exist on cold envs */ }
+  return { map, modelVersion };
+}
+
+// 共用 helper：計算指定賽事日的命中率統計（被 /hit-rate 與 /hit-rate-rollup 共用）
+// alphaOverride: 用於 /admin/api/ensemble-tune α grid search (P4 backtest)。
+// Load the FROZEN per-horse predictions for a past race day from prediction_log
+// (the real bettable snapshot written by writePredictionLog during today-picks,
+// i.e. the SAME compute path that powers the live predictor the user bets on).
+// Returns picks in the subset-shape the hit-rate consumers need, or null to
+// signal "fall back to live recompute".
+// Guards (architect-reviewed):
+//   • filter by engine + variant (PK includes engine) so we never read wrong rows;
+//   • require EVERY race that has results to be fully represented (>=4 ranked picks)
+//     — never return a partial frozen set, which would shrink denominators and
+//     create a second misleading scorecard; partial/empty/error → null → recompute.
+async function loadFrozenPicksForHitRate(
+  db: D1Database,
+  date: string,
+  engine: string,
+  entries: any[],
+): Promise<{ races: any[] } | null> {
+  // Race metadata + ordered race set derived from the results entries.
+  const metaByRace = new Map<number, { distance: any; going: any }>();
+  const raceOrder: number[] = [];
+  for (const e of (entries ?? [])) {
+    if (e?.race_number == null) continue;
+    if (!metaByRace.has(e.race_number)) {
+      metaByRace.set(e.race_number, { distance: e.distance ?? null, going: e.going ?? null });
+      raceOrder.push(e.race_number);
+    }
+  }
+  if (!raceOrder.length) return null;
+  let rows: any[] = [];
+  try {
+    const res = await db.prepare(
+      `SELECT pl.race_number, pl.horse_id, pl.horse_number, pl.draw, pl.horse_elo,
+              pl.elo_composite, pl.factor_bonus, pl.final_score, pl.p_win, pl.p_top3,
+              pl.predicted_rank, pl.lgb_score, pl.lgb_model_version, pl.score_source,
+              h.name_ch AS name_ch
+         FROM prediction_log pl
+         LEFT JOIN horses h ON h.id = pl.horse_id
+        WHERE pl.date = ? AND pl.engine = ? AND pl.variant = 'baseline'
+          AND pl.predicted_rank IS NOT NULL
+        ORDER BY pl.race_number ASC, pl.predicted_rank ASC`,
+    ).bind(date, engine).all<any>();
+    rows = res?.results ?? [];
+  } catch {
+    return null; // table missing / query error → recompute fallback
+  }
+  if (!rows.length) return null;
+  const byRace = new Map<number, any[]>();
+  for (const r of rows) {
+    if (!byRace.has(r.race_number)) byRace.set(r.race_number, []);
+    byRace.get(r.race_number)!.push(r);
+  }
+  // Completeness guard: every result race must have a complete frozen prediction.
+  for (const rn of raceOrder) {
+    const pk = byRace.get(rn);
+    if (!pk || pk.length < 4) return null;
+  }
+  const races = raceOrder.map((rn: number) => {
+    const picks = (byRace.get(rn) ?? [])
+      .slice()
+      .sort((a: any, b: any) => (a.predicted_rank ?? 999) - (b.predicted_rank ?? 999))
+      .map((r: any) => ({
+        horseId: r.horse_id,
+        horseNumber: r.horse_number,
+        draw: r.draw,
+        nameCh: r.name_ch ?? (r.horse_number != null ? String(r.horse_number) : null),
+        nameEn: null,
+        jockeyCh: null,
+        trainerCh: null,
+        horseElo: r.horse_elo,
+        jockeyElo: null,
+        trainerElo: null,
+        eloComposite: r.elo_composite,
+        factorBonus: r.factor_bonus,
+        finalScore: r.final_score,
+        pWin: r.p_win,
+        pTop3: r.p_top3,
+        rank: r.predicted_rank,
+        lgbScore: r.lgb_score,
+        lgbModelVersion: r.lgb_model_version,
+        scoreSource: r.score_source,
+      }));
+    const lgbHits = picks.filter((p: any) => p.scoreSource === 'lgb' || p.lgbScore != null).length;
+    const anyLgb = lgbHits > 0;
+    // Accountability: the frozen rows carry the ensemble alpha actually used at
+    // bet time inside score_source (e.g. "tx-oracle-v3 (ensemble α=0.88)").
+    // Surface it so 預測與賽果 can label the archived version per race instead of
+    // implying the current production alpha was used historically.
+    let frozenAlpha: number | null = null;
+    for (const p of picks) {
+      const mm = /\u03b1\s*=\s*([0-9.]+)/.exec(String((p as any).scoreSource ?? ''));
+      if (mm) { const v = Number(mm[1]); if (Number.isFinite(v)) { frozenAlpha = v; break; } }
+    }
+    const meta = metaByRace.get(rn) ?? { distance: null, going: null };
+    return {
+      raceNumber: rn,
+      title: null,
+      distance: meta.distance,
+      going: meta.going,
+      picks,
+      // Race-level scoreSource kept compatible with summary aggregation
+      // (includes('tx-oracle') → ensemble; startsWith('elo') → elo-only).
+      scoreSource: anyLgb
+        ? `tx-oracle-v3 (frozen, lgb=${lgbHits}${frozenAlpha != null ? `, \u03b1=${frozenAlpha.toFixed(2)}` : ''})`
+        : 'elo (frozen)',
+      ensembleAlpha: frozenAlpha,
+      lgbModelVersion: picks.find((p: any) => p.lgbModelVersion)?.lgbModelVersion ?? null,
+      lgbCoverage: { hits: lgbHits, total: picks.length, applied: anyLgb },
+    };
+  });
+  return { races };
+}
+
+export async function computeHitRateStats(db: D1Database, date: string, engine: EloEngine, alphaOverride?: number, opts?: { boxPayouts?: boolean; eloWeightsOverride?: EloWeights; drawModelOverride?: DrawModel; drawScaleOverride?: number }): Promise<
+  | { error: string; status: number }
+  | { meeting: any; races: any[]; summary: any }
+> {
+  const meeting = await db.prepare(`SELECT m.* FROM race_meetings m WHERE m.date = ? AND m.venue IN ('ST','HV') ORDER BY (SELECT COUNT(*) FROM races r WHERE r.meeting_id = m.id) DESC, m.id LIMIT 1`).bind(date).first<any>().catch(() => null);
+  if (!meeting) return { error: `${date} 賽馬日記錄不存在`, status: 404 };
+  const { results: entries } = await db.prepare(
+    `SELECT r.race_number, rr.horse_number, rr.horse_id, rr.draw, rr.actual_weight,
+            rr.actual_weight AS declared_weight, rr.jockey_id, rr.trainer_id,
+            r.distance, r.going, r.class AS race_class,
+            r.track, r.course,
+            h.name_ch, h.name_en,
+            j.name_ch AS jockey_name, t.name_ch AS trainer_name
+     FROM race_results rr
+     JOIN races r ON r.id = rr.race_id
+     JOIN race_meetings rm ON rm.id = r.meeting_id
+     LEFT JOIN horses h ON h.id = rr.horse_id
+     LEFT JOIN jockeys j ON j.id = rr.jockey_id
+     LEFT JOIN trainers t ON t.id = rr.trainer_id
+     WHERE rm.date = ? AND rm.venue IN ('ST','HV')
+     ORDER BY r.race_number, rr.horse_number`
+  ).bind(date).all<any>().catch(() => ({ results: [] as any[] }));
+  if (!entries?.length) return { error: `${date} 賽果無資料 — 可能為未來賽事或結果未同步`, status: 404 };
+  const { results: actual } = await db.prepare(
+    `SELECT r.race_number, rr.horse_number, rr.horse_id, rr.finishing_position, rr.win_odds, h.name_ch
+     FROM race_results rr
+     JOIN races r ON r.id = rr.race_id
+     JOIN race_meetings rm ON rm.id = r.meeting_id
+     LEFT JOIN horses h ON h.id = rr.horse_id
+     WHERE rm.date = ? AND rm.venue IN ('ST','HV') AND rr.finishing_position IS NOT NULL AND rr.finishing_position > 0
+     ORDER BY r.race_number, rr.finishing_position`
+  ).bind(date).all<any>().catch(() => ({ results: [] as any[] }));
+  const actualByRace = new Map<number, any[]>();
+  for (const r of (actual ?? [])) {
+    if (!actualByRace.has(r.race_number)) actualByRace.set(r.race_number, []);
+    actualByRace.get(r.race_number)!.push(r);
+  }
+  // ── PREDICTION VS RESULT accountability fix ───────────────────────────
+  // For PAST dates, source the predicted side from the FROZEN prediction_log
+  // (what was actually bettable) instead of a live recompute, which drifts:
+  // results-derived entries drop scratched runners (changing per-race z-norm),
+  // ELO is read as-of-date but post-race backfill mutates it, and the LGB
+  // lookup race_id can shift. Recompute is kept ONLY for the α grid-search
+  // backtest (alphaOverride != null) and as a fallback when no complete frozen
+  // log exists (e.g. meetings predating prediction_log).
+  const eloWeightsOverride = opts?.eloWeightsOverride;
+  const drawModelOverride = opts?.drawModelOverride;
+  const drawScaleOverride = opts?.drawScaleOverride;
+  let picksData: any = (alphaOverride == null && eloWeightsOverride == null && drawModelOverride == null && drawScaleOverride == null)
+    ? await loadFrozenPicksForHitRate(db, date, engine, entries)
+    : null;
+  const postLockRaces = picksData ? await postLockRaceNumbers(db, date, (meeting as any)?.venue ?? null, engine) : [];
+  const picksFromFrozenLog = !!picksData && postLockRaces.length === 0;
+  if (!picksData) {
+    picksData = await computePicksFromEntries(db, date, meeting, entries, engine, alphaOverride, eloWeightsOverride, drawModelOverride, drawScaleOverride);
+  }
+  // ── 模型四揀複式 box-bet payouts (mirror tools/tg_notify build_extras) ──
+  // Official dividends scraped LIVE from the HKJC results page (fetchHkjcBoxDivs)
+  // each compute — available for ALL dates incl. historical. Only fetched when
+  // opts.boxPayouts is set; coverage (4中N) is derived consumer-side and always shown.
+  const wantBoxPayouts = !!(opts && opts.boxPayouts);
+  let divByRaceNumber = new Map<number, Record<string, BoxCombo[]>>();
+  let boxDivsComplete = false;
+  if (wantBoxPayouts) {
+    // Only fetch dividends for races where the model top-4 actually won a box pool
+    // (任序首3 trio or 任序首4) — typically 0-3 of ~9 races. HKJC throttles Cloudflare
+    // egress, so fetching every race serialises to ~30s; this limits it to the few
+    // races that can produce a payout. Win logic mirrors the per-race loop below.
+    const needRns: number[] = [];
+    for (const race of picksData.races) {
+      const m4 = (race.picks ?? []).slice(0, 4).map((p: any) => p.horseNumber).filter((v: any) => v != null && v !== '').map((v: any) => String(v));
+      const mset = new Set<string>(m4);
+      if (mset.size !== 4) continue;
+      // Any box pool (trio/tierce need 3 horses, FF/quartet need 4) can only pay
+      // if the model box covers >=3 of the placed runners. Use finishing_position
+      // <=4 so dead-heat placers (a tie can leave >4 horses in the top 4) are all
+      // eligible; the precise per-combo payout is resolved after fetch below.
+      const placed = (actualByRace.get(race.raceNumber) ?? [])
+        .filter((a: any) => a.finishing_position != null && a.finishing_position <= 4)
+        .map((a: any) => String(a.horse_number));
+      const overlap = placed.filter((x: string) => mset.has(x)).length;
+      if (overlap >= 3) needRns.push(race.raceNumber);
+    }
+    const fetched = await fetchHkjcBoxDivs(date, meeting.venue, needRns);
+    divByRaceNumber = fetched.byRace;
+    boxDivsComplete = fetched.complete;
+  }
+  // HK pool hit metrics — computed per race, aggregated into summary.
+    // racesEvaluated = denom for top1/top3-any/Q/QP/Trio/Tierce (need actual top-3).
+    // first4Eligible = denom for First 4 (need actual top-4).
+    let top1Hits = 0, top3AnyHits = 0, top3SumIntersect = 0, racesEvaluated = 0;
+    let quinellaHits = 0, qpHits = 0, trioHits = 0, tierceHits = 0;
+    let first4Hits = 0, first4Eligible = 0;
+    let quartetHits = 0;  // 四重彩：頭四名要順序全中
+    let top4SumIntersect = 0, top4Eligible = 0;
+    const races = picksData.races.map((race: any) => {
+      const actualSorted = (actualByRace.get(race.raceNumber) ?? []).sort((a: any, b: any) => a.finishing_position - b.finishing_position);
+      const predictedTop3 = (race.picks ?? []).slice(0, 3);
+      const predictedTop2 = predictedTop3.slice(0, 2);
+      const predictedTop4 = (race.picks ?? []).slice(0, 4);
+      const actualTop3 = actualSorted.slice(0, 3);
+      const actualTop2 = actualSorted.slice(0, 2);
+      const actualTop4 = actualSorted.slice(0, 4);
+      const actualTop1Id = actualTop3[0]?.horse_id ?? null;
+      const actualTop3Ids = new Set(actualTop3.map((a: any) => a.horse_id));
+      const actualTop2Ids = new Set(actualTop2.map((a: any) => a.horse_id));
+      const actualTop4Ids = new Set(actualTop4.map((a: any) => a.horse_id));
+        // odds lookup by horse_id (covers ALL runners in race_results, not just top 4)
+        const oddsById = new Map<string, number | null>(
+          (actualByRace.get(race.raceNumber) ?? []).map((a: any) => [a.horse_id, a.win_odds ?? null])
+        );
+
+      const top1Hit = actualTop1Id != null && predictedTop3[0]?.horseId === actualTop1Id;
+      const intersect = predictedTop3.filter((p: any) => actualTop3Ids.has(p.horseId)).length;
+      const top3AnyHit = intersect > 0;
+
+      // Quinella (Q): our top 2 == actual top 2 (any order)
+      const quinellaHit = predictedTop2.length === 2 && actualTop2.length === 2
+        && predictedTop2.every((p: any) => actualTop2Ids.has(p.horseId));
+      // Quinella Place (QP): both our top 2 finish in actual top 3 (any order)
+      const qpHit = predictedTop2.length === 2 && actualTop3.length >= 3
+        && predictedTop2.every((p: any) => actualTop3Ids.has(p.horseId));
+      // Trio: our top 3 == actual top 3 (any order, exact set)
+      const trioHit = predictedTop3.length === 3 && actualTop3.length === 3
+        && predictedTop3.every((p: any) => actualTop3Ids.has(p.horseId));
+      // Tierce (3T): our top 3 == actual top 3 in EXACT order
+      const tierceHit = predictedTop3.length === 3 && actualTop3.length === 3
+        && predictedTop3[0]?.horseId === actualTop3[0]?.horse_id
+        && predictedTop3[1]?.horseId === actualTop3[1]?.horse_id
+        && predictedTop3[2]?.horseId === actualTop3[2]?.horse_id;
+      // First 4 (F4): our top 4 == actual top 4 (any order)
+      const first4Hit = predictedTop4.length === 4 && actualTop4.length === 4
+        && predictedTop4.every((p: any) => actualTop4Ids.has(p.horseId));
+      // Quartet (4T, 四重彩): our top 4 == actual top 4 in EXACT order
+      const quartetHit = predictedTop4.length === 4 && actualTop4.length === 4
+        && predictedTop4.every((p: any, i: number) => p.horseId === actualTop4[i]?.horse_id);
+
+      if (actualTop3.length >= 3) {
+        racesEvaluated++;
+        if (top1Hit) top1Hits++;
+        if (top3AnyHit) top3AnyHits++;
+        top3SumIntersect += intersect;
+        if (quinellaHit) quinellaHits++;
+        if (qpHit) qpHits++;
+        if (trioHit) trioHits++;
+        if (tierceHit) tierceHits++;
+      }
+      // ── New: 首選/次選/三選/四選 命中數（top-4 set overlap, 0..4） ──
+      const top4IntersectCount = predictedTop4.filter((p: any) => actualTop4Ids.has(p.horseId)).length;
+      if (actualTop4.length >= 4) {
+        first4Eligible++;
+        if (first4Hit) first4Hits++;
+        if (quartetHit) quartetHits++;
+        top4Eligible++;
+        top4SumIntersect += top4IntersectCount;
+      }
+
+      // ── box-bet payouts for the model top-4 (mirror tg_notify build_extras) ──
+      // A 四揀複式 box covers every ordering of the model's 4 picks, so it wins a
+      // pool's combo iff that combo's horses are ALL within the box. Dead-heat
+      // races pay multiple combos per pool — sum every covered combo. (A blind
+      // per-pool sum would overstate when the box misses a tied placer, so we
+      // gate each combo on coverage rather than crediting the whole pool.)
+      let boxPayouts: Array<{ pool: string; name: string; units: number; cost: number; dividend: number; net: number }> = [];
+      {
+        const m4nums = predictedTop4.map((p: any) => p.horseNumber).filter((v: any) => v != null && v !== '').map((v: any) => String(v));
+        const mset = new Set<string>(m4nums);
+        if (mset.size === 4) {
+          const divs = divByRaceNumber.get(race.raceNumber) ?? {};
+          const pools: Array<{ pool: string; d1: string; name: string; units: number }> = [
+            { pool: 'FF', d1: 'FF', name: '四連環（任序首4）', units: 1 },
+            { pool: 'TRIO', d1: 'TRI', name: '單T（任序首3）', units: 4 },
+            { pool: 'TIERCE', d1: 'TCE', name: '三重彩（依序首3）', units: 24 },
+            { pool: 'QUARTET', d1: 'QTT', name: '四重彩（依序首4）', units: 24 },
+          ];
+          for (const pl of pools) {
+            const combos = divs[pl.d1] ?? [];
+            let amt = 0;
+            for (const cb of combos) {
+              if (cb.nums.length && cb.nums.every((n: string) => mset.has(n))) amt += cb.div;
+            }
+            if (amt <= 0) continue;
+            const cost = pl.units * 10;
+            boxPayouts.push({ pool: pl.pool, name: pl.name, units: pl.units, cost, dividend: Math.round(amt), net: Math.round(amt - cost) });
+          }
+        }
+      }
+      return {
+        raceNumber: race.raceNumber, title: race.title, distance: race.distance, going: race.going,
+        predictedTop3: predictedTop3.map((p: any) => ({
+          rank: p.rank, horseNumber: p.horseNumber, horseId: p.horseId,
+          nameCh: p.nameCh, jockeyCh: p.jockeyCh, trainerCh: p.trainerCh,
+          horseElo: p.horseElo, jockeyElo: p.jockeyElo, trainerElo: p.trainerElo,
+          eloComposite: p.eloComposite, finalScore: p.finalScore, pWin: p.pWin,
+          lgbScore: p.lgbScore ?? null, lgbModelVersion: p.lgbModelVersion ?? null,
+          scoreSource: p.scoreSource ?? null,
+        })),
+        scoreSource: (race as any).scoreSource ?? null,
+        ensembleAlpha: (race as any).ensembleAlpha ?? null,
+        lgbModelVersion: (race as any).lgbModelVersion ?? null,
+        lgbCoverage: (race as any).lgbCoverage ?? null,
+        // New: top-4 picks (rank 1-4) with per-pick reason text + hit flag
+        predictedTop4: predictedTop4.map((p: any) => ({
+          rank: p.rank, horseNumber: p.horseNumber, horseId: p.horseId,
+          nameCh: p.nameCh, jockeyCh: p.jockeyCh, trainerCh: p.trainerCh,
+          horseElo: p.horseElo, jockeyElo: p.jockeyElo, trainerElo: p.trainerElo,
+          eloComposite: p.eloComposite, finalScore: p.finalScore, pWin: p.pWin,
+          lgbScore: p.lgbScore ?? null, lgbModelVersion: p.lgbModelVersion ?? null,
+          scoreSource: p.scoreSource ?? null,
+          factorBonus: p.factorBonus,
+          reason: buildPickReason(p),
+          hit: actualTop4Ids.has(p.horseId),
+          winOdds: oddsById.get(p.horseId) ?? null,
+        })),
+        actualTop3: actualTop3.map((a: any) => ({
+          position: a.finishing_position, horseNumber: a.horse_number, horseId: a.horse_id,
+          nameCh: a.name_ch, winOdds: a.win_odds,
+        })),
+        // New: actual top-4 with hit flag (whether we picked it in our top-4)
+        actualTop4: actualTop4.map((a: any) => ({
+          position: a.finishing_position, horseNumber: a.horse_number, horseId: a.horse_id,
+          nameCh: a.name_ch, winOdds: a.win_odds,
+          hit: predictedTop4.some((p: any) => p.horseId === a.horse_id),
+        })),
+        top1Hit, top3IntersectCount: intersect, top3AnyHit,
+        top4IntersectCount,
+        quinellaHit, qpHit, trioHit, tierceHit, first4Hit, quartetHit,
+        boxPayouts,
+      };
+    });
+    const rate = (n: number, d: number) => d ? Math.round(n / d * 1000) / 10 : null;
+    // P0 architect fix 2026-05-21: surface ensemble availability so admin/UI
+    // can distinguish meetings actually scored by TX-Oracle v3 from those
+    // that silently fell back to pure ELO+factor (lgb_predictions empty for
+    // past dates). Aggregates per-race scoreSource into meeting-level counts.
+    let ensembleRaces = 0, eloOnlyRaces = 0, lgbHitsTotal = 0, lgbSlotsTotal = 0;
+    for (const r of races) {
+      const src = (r as any).scoreSource || 'unknown';
+      if (src.includes('tx-oracle')) ensembleRaces++; else if (src.startsWith('elo')) eloOnlyRaces++;
+      const cov = (r as any).lgbCoverage;
+      if (cov) { lgbHitsTotal += cov.hits || 0; lgbSlotsTotal += cov.total || 0; }
+    }
+    const ensembleCoveragePct = races.length ? Math.round(ensembleRaces / races.length * 1000) / 10 : null;
+    return {
+      meeting,
+      races,
+      summary: {
+        racesEvaluated,
+        top1HitRate: rate(top1Hits, racesEvaluated),
+        top3AnyHitRate: rate(top3AnyHits, racesEvaluated),
+        top3AvgIntersect: racesEvaluated ? Math.round(top3SumIntersect/racesEvaluated*100)/100 : null,
+        quinellaHitRate: rate(quinellaHits, racesEvaluated),
+        qpHitRate: rate(qpHits, racesEvaluated),
+        trioHitRate: rate(trioHits, racesEvaluated),
+        tierceHitRate: rate(tierceHits, racesEvaluated),
+        first4HitRate: rate(first4Hits, first4Eligible),
+        quartetHitRate: rate(quartetHits, first4Eligible),
+        top1Hits, top3AnyHits, top3SumIntersect,
+        quinellaHits, qpHits, trioHits, tierceHits,
+        first4Hits, first4Eligible, quartetHits,
+        // New: 首/次/三/四選平均命中數 (out of 4)
+        top4SumIntersect, top4Eligible,
+        top4AvgIntersect: top4Eligible ? Math.round(top4SumIntersect / top4Eligible * 100) / 100 : null,
+        // P0 fix: ensemble availability transparency
+        ensembleAvailable: ensembleRaces > 0,
+        ensembleCoveragePct,
+        scoreSourceBreakdown: { ensemble: ensembleRaces, eloOnly: eloOnlyRaces, total: races.length },
+        lgbRunnerCoverage: lgbSlotsTotal ? { hits: lgbHitsTotal, slots: lgbSlotsTotal, pct: Math.round(lgbHitsTotal / lgbSlotsTotal * 1000) / 10 } : null,
+        fallbackReason: ensembleRaces === 0 && races.length > 0 ? 'LGB_PREDICTIONS_MISSING' : null,
+        boxDivsFetched: wantBoxPayouts,
+        boxDivsComplete,
+        // 對帳來源標記：冇完整鎖前 prediction_log 就係重算，只作對帳參考，
+        // 「鎖後、唔計分」——唔入凍結戰績（凍結戰績只讀 freeze-ledger）。
+        picksSource: picksFromFrozenLog ? 'frozen-log' : 'recompute',
+        countsTowardFrozenRecord: picksFromFrozenLog,
+        scoringNote: picksFromFrozenLog ? null : '鎖後、唔計分',
+        postLockRaces,
+      },
+    };
+  }
+
+// POST /api/analyze — 因子分析（TimesFM + AI 綜合建議）
+analyzeRoutes.post('/', async (c) => {
+  if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+  const body = await c.req.json<AnalyzeRequest>();
+  const { raceId, factors } = body;
+
+  if (!raceId || !factors || factors.length === 0) {
+    return c.json({ error: '請提供賽事 ID 和至少一個分析因子' }, 400);
+  }
+
+  try {
+    // Step 1: 獲取賽事和出賽馬匹數據
+    const race = await c.env.DB.prepare(`
+      SELECT r.*, rm.date, rm.venue, rm.track_condition, rm.weather
+      FROM races r
+      JOIN race_meetings rm ON rm.id = r.meeting_id
+      WHERE r.id = ? AND rm.venue IN ('ST','HV')
+    `).bind(raceId).first<any>();
+
+    if (!race) {
+      return c.json({ error: '找不到該場賽事' }, 404);
+    }
+
+    const { results: entries } = await c.env.DB.prepare(`
+      SELECT rr.horse_id, rr.horse_number, rr.draw, rr.win_odds, rr.gear,
+        h.name_en, h.name_ch, h.code, h.sire, h.dam, h.current_rating,
+        j.name_ch AS jockey_ch, t.name_ch AS trainer_ch
+      FROM race_results rr
+      JOIN horses h ON h.id = rr.horse_id
+      LEFT JOIN jockeys j ON j.id = rr.jockey_id
+      LEFT JOIN trainers t ON t.id = rr.trainer_id
+      WHERE rr.race_id = ?
+      ORDER BY rr.horse_number
+    `).bind(raceId).all();
+
+    const horseIds = (entries ?? []).map((e: any) => e.horse_id);
+
+    // TimesFM trend prediction removed 2026-05-25 (exploration not productionized)
+    const timesfmResults: any[] = [];
+
+    // Step 3: 構建賽事 context 並調用 AI 綜合分析
+    const raceData = {
+      date: race.date,
+      venue: race.venue,
+      trackCondition: race.track_condition,
+      races: [{
+        raceNumber: race.race_number,
+        title: race.title,
+        distance: race.distance,
+        class: race.class,
+        going: race.going,
+        track: race.track,
+        horses: (entries ?? []).map((e: any) => ({
+          horseNumber: e.horse_number,
+          nameCh: e.name_ch,
+          name: e.name_en,
+          draw: e.draw,
+          jockeyCh: e.jockey_ch,
+          trainerCh: e.trainer_ch,
+          winOdds: e.win_odds,
+          gear: e.gear,
+          rating: e.current_rating,
+          sire: e.sire,
+          dam: e.dam,
+        })),
+      }],
+    };
+
+    const { aiSummary, recommendations } = await generateAnalysisSummary(
+      c.env,
+      raceData,
+      timesfmResults,
+      factors
+    );
+
+    // 計算整體信心度
+    const avgConfidence = timesfmResults.length > 0
+      ? timesfmResults.reduce((sum, r) => sum + r.confidence, 0) / timesfmResults.length
+      : 0.7;
+
+    return c.json({
+      raceId,
+      raceNumber: race.race_number,
+      raceTitle: race.title,
+      selectedFactors: factors,
+      timesfmResults,
+      aiSummary,
+      recommendations,
+      overallConfidence: Math.round(avgConfidence * 100) / 100,
+    });
+  } catch (err: any) {
+    console.error('Analysis error:', err);
+    return c.json({
+      error: '分析時發生錯誤',
+      details: err.message,
+    }, 500);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Composite-score helpers (Phase B · ELO 0.7/0.2/0.1 + factor adjustments)
+// ──────────────────────────────────────────────────────────────────────────
+
+// Weight split confirmed by user 2026-04-28.
+const ELO_WEIGHTS = { horse: 0.7, jockey: 0.2, trainer: 0.1 } as const;
+
+// ── ELO 三軸權重（可調）─────────────────────────────────────────────
+// 生產值存 app_settings(key='elo_weights') JSON，未設定時回落上面預設。
+// 由 /api/analyze/elo-tune grid search 回測後 ?apply=1 寫入。
+export type EloWeights = { horse: number; jockey: number; trainer: number };
+function normalizeEloWeights(w: any): EloWeights | null {
+  const h = Number(w?.horse), j = Number(w?.jockey), t = Number(w?.trainer);
+  if (![h, j, t].every((v) => Number.isFinite(v) && v >= 0)) return null;
+  const sum = h + j + t;
+  if (!(sum > 0)) return null;
+  return { horse: h / sum, jockey: j / sum, trainer: t / sum };
+}
+export async function getEloWeights(db: D1Database): Promise<EloWeights> {
+  try {
+    await db.prepare(
+      `CREATE TABLE IF NOT EXISTS app_settings (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL,
+         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+       )`
+    ).run().catch(() => {});
+    const row = await db.prepare(
+      `SELECT value FROM app_settings WHERE key = 'elo_weights'`
+    ).first<{ value: string }>().catch(() => null);
+    if (row?.value) {
+      const parsed = normalizeEloWeights(JSON.parse(row.value));
+      if (parsed) return parsed;
+    }
+  } catch { /* ignore */ }
+  return { ...ELO_WEIGHTS };
+}
+
+// 檔位效應模型版本：v1 = 場地+路程固定 0.25 基準；v2 = 場地+賽道(rail)+路程分層 + 場數期望 + 收縮；
+// v3 = v2 再加三個分層（場地狀況 going／出賽匹數 field size／班次 class），各層向 base 經驗貝葉斯收縮，取用時以信心加權合成。
+export type DrawModel = 'v1' | 'v2' | 'v3';
+export async function getDrawModel(db: D1Database): Promise<DrawModel> {
+  try {
+    const row = await db.prepare(`SELECT value FROM app_settings WHERE key = 'draw_model'`).first<{ value: string }>().catch(() => null);
+    if (row?.value === 'v3') return 'v3';
+    if (row?.value === 'v2') return 'v2';
+  } catch { /* ignore */ }
+  return 'v1';
+}
+
+// 由 races.course（例：草地 - "C+3" 賽道 / 全天候跑道）取出跑道鍵。
+export function railKey(course: string | null | undefined): string {
+  const c = String(course || '').trim();
+  if (!c) return 'NA';
+  if (c.includes('全天候')) return 'AWT';
+  const m = c.match(/"([^"]+)"/) || c.match(/[""]([^""]+)[""]/);
+  return m ? m[1]!.toUpperCase() : 'NA';
+}
+
+// 場地狀況分層鍵：快／好／黏／軟／濕（全天候）。
+export function goingKey(going: string | null | undefined): string {
+  const g = String(going || '').trim();
+  if (!g) return 'NA';
+  if (g.includes('濕')) return 'WET';
+  if (g.includes('軟')) return 'SOFT';
+  if (g.includes('黏')) return 'YLD';
+  if (g.includes('快')) return 'FAST';
+  if (g.includes('好')) return 'GOOD';
+  return 'NA';
+}
+
+// 出賽匹數分層鍵：細場 ≤8、中場 9-11、大場 12+。
+export function fieldKey(n: number | null | undefined): string {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return 'NA';
+  if (v <= 8) return 'S';
+  if (v <= 11) return 'M';
+  return 'L';
+}
+
+// 班次分層鍵：第一至第五班／新馬／分級賽。
+export function classKey(cls: string | null | undefined): string {
+  const c = String(cls || '').trim();
+  if (!c) return 'NA';
+  if (/(第一級|第二級|第三級|G1|G2|G3|Group)/i.test(c)) return 'GRP';
+  if (c.includes('新馬')) return 'GRIFFIN';
+  const m = c.match(/第([一二三四五1-5])班/);
+  if (m) {
+    const map: Record<string, string> = { 一: '1', 二: '2', 三: '3', 四: '4', 五: '5' };
+    return 'C' + (map[m[1]!] ?? m[1]!);
+  }
+  return 'NA';
+}
+
+// ELO engine version selector (v1.2 = time-weighted multi-axis, user-endorsed 2026-04-28).
+// Rows in snapshot tables co-exist; v1.2 rows have id prefix 'v12:', v1.1 rows don't.
+// Defaults to v12; reads can opt into v11 via ?engine=v11 query param or env override.
+type EloEngine = 'v11' | 'v12';
+
+type EloReading = {
+  rating: number;
+  confidence: number | null;
+  isFrozen: boolean;
+  isRetired: boolean;
+  isProvisional: boolean;
+  engine: EloEngine;
+};
+
+async function fetchAxisEloReading(
+  db: D1Database,
+  entityTable: 'horse' | 'jockey' | 'trainer',
+  entityId: string | number,
+  asOf: string,
+  engine: EloEngine,
+): Promise<EloReading | null> {
+  const table = `${entityTable}_elo_snapshots`;
+  const col = `${entityTable}_id`;
+  // v1.2 snapshots carry extra columns (confidence / is_frozen / is_retired / is_provisional);
+  // v1.1 rows don't have them. Try the richer query for v12; if schema lacks columns (e.g. D1
+  // hasn't had v12 migration applied yet) or no v12 rows exist, fall back to v11.
+  if (engine === 'v12') {
+    try {
+      const row = await db.prepare(
+        `SELECT rating, confidence, is_frozen, is_retired, is_provisional
+           FROM ${table}
+          WHERE ${col} = ? AND axis_key = 'overall' AND as_of_date < ?
+            AND id LIKE 'v12:%'
+          ORDER BY as_of_date DESC LIMIT 1`
+      ).bind(entityId, asOf).first<any>();
+      if (row?.rating != null) {
+        return {
+          rating: row.rating,
+          confidence: row.confidence ?? null,
+          isFrozen: !!row.is_frozen,
+          isRetired: !!row.is_retired,
+          isProvisional: !!row.is_provisional,
+          engine: 'v12',
+        };
+      }
+    } catch {
+      // v12 columns missing (pre-migration D1) — fall through to v11
+    }
+  }
+  try {
+    const row = await db.prepare(
+      `SELECT rating FROM ${table}
+        WHERE ${col} = ? AND axis_key = 'overall' AND as_of_date < ?
+          AND id NOT LIKE 'v12:%'
+        ORDER BY as_of_date DESC LIMIT 1`
+    ).bind(entityId, asOf).first<any>();
+    return row?.rating != null
+      ? { rating: row.rating, confidence: null, isFrozen: false, isRetired: false, isProvisional: false, engine: 'v11' }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// Thin compat shim: legacy callers that only need the raw rating.
+async function fetchAxisElo(
+  db: D1Database,
+  entityTable: 'horse' | 'jockey' | 'trainer',
+  entityId: string | number,
+  asOf: string,
+  engine: EloEngine = 'v12',
+): Promise<number | null> {
+  const reading = await fetchAxisEloReading(db, entityTable, entityId, asOf, engine);
+  return reading?.rating ?? null;
+}
+
+// Recency factor: peak fitness 14-28 days post-race, decay outside.
+// Returns value roughly in -20..+15 range (unitless score points).
+function recencyBonus(daysSinceLast: number | null): number {
+  if (daysSinceLast == null) return 0;
+  if (daysSinceLast < 7) return -10;  // too soon
+  if (daysSinceLast <= 28) return 10; // sweet spot
+  if (daysSinceLast <= 60) return 0;  // neutral
+  if (daysSinceLast <= 120) return -5;
+  return -15; // long layoff
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Per-race adjustment factors (constitutional spec 2026-04-28)
+//   — score = ELO_composite + Σ(factor × weight)
+//   — weights chosen so each factor caps around ±10-20 ELO-equivalent points
+//   — returns {bonus, conf, note} so `/explain` can render dual-line breakdown
+// ──────────────────────────────────────────────────────────────────────────
+
+type FactorResult = { bonus: number; conf: number; note: string };
+
+// Distance bucket: round to nearest 200m; "fit" = same bucket, "near" = ±200m.
+function distBucket(d: number | null | undefined): number | null {
+  if (!d || d <= 0) return null;
+  return Math.round(d / 200) * 200;
+}
+
+async function distanceFit(
+  db: D1Database,
+  horseId: string,
+  raceDistance: number | null,
+  asOf: string,
+): Promise<FactorResult> {
+  const bucket = distBucket(raceDistance);
+  if (!bucket) return { bonus: 0, conf: 0, note: '途程資料不全' };
+  const row = await db.prepare(`
+    SELECT
+      SUM(CASE WHEN rr.finishing_position = 1 THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3,
+      COUNT(*) AS starts
+    FROM race_results rr
+    JOIN races r ON r.id = rr.race_id
+    JOIN race_meetings rm ON rm.id = r.meeting_id
+    WHERE rr.horse_id = ?
+      AND rm.date < ?
+      AND r.distance BETWEEN ? AND ?
+      AND rr.finishing_position > 0 AND rr.finishing_position < 99
+  `).bind(horseId, asOf, bucket - 200, bucket + 200).first<any>();
+  const starts = row?.starts ?? 0;
+  if (starts < 2) return { bonus: 0, conf: 0, note: `${bucket}m 無足夠往績` };
+  const winRate = (row.wins ?? 0) / starts;
+  const top3Rate = (row.top3 ?? 0) / starts;
+  // Map: 30% top-3 → 0 bonus; each 10pp = ±5 points; cap ±20
+  const bonus = Math.max(-20, Math.min(20, (top3Rate - 0.3) * 50));
+  return {
+    bonus,
+    conf: Math.min(1, starts / 5),
+    note: `${bucket}m 歷往 ${starts} 戰 ${row.top3 ?? 0}上 (${Math.round(top3Rate * 100)}%)`,
+  };
+}
+
+async function goingFit(
+  db: D1Database,
+  horseId: string,
+  going: string | null,
+  asOf: string,
+): Promise<FactorResult> {
+  if (!going) return { bonus: 0, conf: 0, note: '場地狀況未定' };
+  const row = await db.prepare(`
+    SELECT
+      SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3,
+      COUNT(*) AS starts
+    FROM race_results rr
+    JOIN races r ON r.id = rr.race_id
+    JOIN race_meetings rm ON rm.id = r.meeting_id
+    WHERE rr.horse_id = ?
+      AND rm.date < ?
+      AND r.going = ?
+      AND rr.finishing_position > 0 AND rr.finishing_position < 99
+  `).bind(horseId, asOf, going).first<any>();
+  const starts = row?.starts ?? 0;
+  if (starts < 2) return { bonus: 0, conf: 0, note: `${going} 場無足夠往績` };
+  const top3Rate = (row.top3 ?? 0) / starts;
+  const bonus = Math.max(-15, Math.min(15, (top3Rate - 0.3) * 40));
+  return {
+    bonus,
+    conf: Math.min(1, starts / 4),
+    note: `${going} ${starts} 戰 ${row.top3 ?? 0}上 (${Math.round(top3Rate * 100)}%)`,
+  };
+}
+
+async function drawBias(
+  db: D1Database,
+  draw: number | null,
+  venue: string | null,
+  raceDistance: number | null,
+  asOf: string,
+): Promise<FactorResult> {
+  if (!draw || !venue || !raceDistance) return { bonus: 0, conf: 0, note: '檔位/場地不全' };
+  const bucket = distBucket(raceDistance)!;
+  const row = await db.prepare(`
+    SELECT
+      SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3,
+      COUNT(*) AS starts
+    FROM race_results rr
+    JOIN races r ON r.id = rr.race_id
+    JOIN race_meetings rm ON rm.id = r.meeting_id
+    WHERE rm.venue = ?
+      AND rm.date < ?
+      AND r.distance BETWEEN ? AND ?
+      AND rr.draw = ?
+      AND rr.finishing_position > 0 AND rr.finishing_position < 99
+  `).bind(venue, asOf, bucket - 100, bucket + 100, draw).first<any>();
+  const starts = row?.starts ?? 0;
+  if (starts < 20) return { bonus: 0, conf: 0, note: `檔 ${draw} 樣本不足` };
+  const top3Rate = (row.top3 ?? 0) / starts;
+  // Baseline top-3 rate ≈ 3/field-size; use 0.25 as reference.
+  const bonus = Math.max(-10, Math.min(10, (top3Rate - 0.25) * 60));
+  return {
+    bonus,
+    conf: Math.min(1, starts / 80),
+    note: `檔${draw} ${venue}/${bucket}m 歷年 ${Math.round(top3Rate * 100)}% 上位率`,
+  };
+}
+
+// Condition (晨操強度) — trackwork 14d window; 4-6 sessions = sweet spot.
+async function conditionFit(
+  db: D1Database,
+  horseId: string,
+  asOf: string,
+): Promise<FactorResult> {
+  try {
+    const row = await db.prepare(`
+      SELECT COUNT(*) AS sessions
+      FROM horse_trackwork
+      WHERE horse_id = ?
+        AND trackwork_date >= date(?, '-14 days')
+        AND trackwork_date < ?
+    `).bind(horseId, asOf, asOf).first<any>();
+    const n = row?.sessions ?? 0;
+    if (n === 0) return { bonus: 0, conf: 0, note: '無晨操記錄' };
+    // Sweet spot: 4-6 sessions in 14 days.
+    let bonus = 0;
+    if (n >= 4 && n <= 6) bonus = 8;
+    else if (n >= 2 && n <= 8) bonus = 3;
+    else if (n === 1) bonus = -3;
+    else if (n > 8) bonus = -5; // over-training
+    return {
+      bonus,
+      conf: Math.min(1, n / 4),
+      note: `14 天 ${n} 課晨操`,
+    };
+  } catch {
+    return { bonus: 0, conf: 0, note: '晨操資料不全' };
+  }
+}
+
+// Injury flag — recent (90d) injury penalty with decay.
+async function injuryFlag(
+  db: D1Database,
+  horseId: string,
+  asOf: string,
+): Promise<FactorResult> {
+  try {
+    const row = await db.prepare(`
+      SELECT injury_date, resolution_date, days_out, injury_type
+      FROM horse_injury
+      WHERE horse_id = ?
+        AND injury_date < ?
+        AND injury_date >= date(?, '-180 days')
+      ORDER BY injury_date DESC
+      LIMIT 1
+    `).bind(horseId, asOf, asOf).first<any>();
+    if (!row) return { bonus: 0, conf: 0, note: '無近期傷病' };
+    const ms = new Date(asOf).getTime() - new Date(row.injury_date).getTime();
+    const daysAgo = Math.max(1, Math.round(ms / 86400000));
+    // Unresolved (no resolution_date) = stronger penalty
+    const unresolved = !row.resolution_date;
+    const base = unresolved ? -15 : -10;
+    // Exponential decay over 45 days
+    const decayed = base * Math.exp(-daysAgo / 45);
+    return {
+      bonus: Math.max(-15, Math.min(0, decayed)),
+      conf: Math.min(1, 1 - daysAgo / 180),
+      note: `${daysAgo} 天前${row.injury_type ?? '傷病'}${unresolved ? ' (未復原)' : ''}`,
+    };
+  } catch {
+    return { bonus: 0, conf: 0, note: '傷病資料不全' };
+  }
+}
+
+// Jockey-trainer combo — historical top-3 rate when paired; baseline 25%.
+async function jtComboFit(
+  db: D1Database,
+  jockeyId: string | number | null,
+  trainerId: string | number | null,
+  asOf: string,
+): Promise<FactorResult> {
+  if (!jockeyId || !trainerId) return { bonus: 0, conf: 0, note: '騎練配對不全' };
+  try {
+    const row = await db.prepare(`
+      SELECT COUNT(*) AS starts,
+        SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3
+      FROM race_results rr
+      JOIN races r ON r.id = rr.race_id
+      JOIN race_meetings rm ON rm.id = r.meeting_id
+      WHERE rr.jockey_id = ?
+        AND rr.trainer_id = ?
+        AND rm.date < ?
+        AND rr.finishing_position > 0 AND rr.finishing_position < 99
+    `).bind(jockeyId, trainerId, asOf).first<any>();
+    const starts = row?.starts ?? 0;
+    if (starts < 10) return { bonus: 0, conf: 0, note: `配對 ${starts} 戰樣本不足` };
+    const top3Rate = (row.top3 ?? 0) / starts;
+    // Baseline top-3 rate ~0.25; each 10pp = ±4; cap ±12
+    const bonus = Math.max(-12, Math.min(12, (top3Rate - 0.25) * 40));
+    return {
+      bonus,
+      conf: Math.min(1, starts / 30),
+      note: `配對 ${starts} 戰 ${row.top3 ?? 0}上 (${Math.round(top3Rate * 100)}%)`,
+    };
+  } catch {
+    return { bonus: 0, conf: 0, note: '配對資料不全' };
+  }
+}
+
+async function weightDelta(
+  db: D1Database,
+  horseId: string,
+  currentWeight: number | null,
+  asOf: string,
+): Promise<FactorResult> {
+  if (!currentWeight) return { bonus: 0, conf: 0, note: '負磅資料不全' };
+  const row = await db.prepare(`
+    SELECT AVG(rr.actual_weight) AS avg_w, COUNT(*) AS n
+    FROM race_results rr
+    JOIN races r ON r.id = rr.race_id
+    JOIN race_meetings rm ON rm.id = r.meeting_id
+    WHERE rr.horse_id = ?
+      AND rm.date < ?
+      AND rr.actual_weight IS NOT NULL
+    ORDER BY rm.date DESC LIMIT 5
+  `).bind(horseId, asOf).first<any>();
+  const n = row?.n ?? 0;
+  const avgW = row?.avg_w;
+  if (n < 2 || avgW == null) return { bonus: 0, conf: 0, note: '負磅樣本不足' };
+  const delta = currentWeight - avgW;
+  // Heavier than historical = slight penalty; -2 ELO per kg over, capped ±8.
+  const bonus = Math.max(-8, Math.min(8, -delta * 2));
+  return {
+    bonus,
+    conf: Math.min(1, n / 5),
+    note: `負磅 ${currentWeight}磅 vs 近 ${n} 戰均 ${avgW.toFixed(1)}磅 (${delta >= 0 ? '+' : ''}${delta.toFixed(1)})`,
+  };
+}
+
+async function computeComposite(
+  db: D1Database,
+  raceId: string,
+  raceDate: string,
+  engine: EloEngine = 'v12',
+): Promise<Array<any>> {
+  // Load race context once so factor helpers can read distance/going/venue.
+  const raceCtx = await db.prepare(`
+    SELECT r.distance, r.going, rm.venue
+    FROM races r JOIN race_meetings rm ON rm.id = r.meeting_id
+    WHERE r.id = ? AND rm.venue IN ('ST','HV')
+  `).bind(raceId).first<any>();
+  const raceDistance: number | null = raceCtx?.distance ?? null;
+  const raceGoing: string | null = raceCtx?.going ?? null;
+  const raceVenue: string | null = raceCtx?.venue ?? null;
+
+  // ── Stage 7 (2026-05-19): LGB pre-computed score lookup ─────────────────
+  // Nightly GH workflow trains LightGBM lambdarank and writes per-runner
+  // scores to lgb_predictions. When present, lgb_score overrides _score
+  // (the softmax ranking input). ELO breakdown stays in the response for
+  // transparency. Backtest: 21.65% Top1 vs 17.0% ELO baseline (+27% rel).
+  const lgbScoreByHorse: Record<string, number> = {};
+  let lgbModelVersion: string | null = null;
+  try {
+    const { results: lgbRows } = await db.prepare(
+      `SELECT horse_id, lgb_score, model_version FROM lgb_predictions WHERE race_id = ?`
+    ).bind(raceId).all<any>();
+    for (const r of (lgbRows || [])) {
+      lgbScoreByHorse[r.horse_id] = Number(r.lgb_score);
+      if (!lgbModelVersion) lgbModelVersion = r.model_version;
+    }
+  } catch { /* table may not exist on stale workers */ }
+  const hasLgb = Object.keys(lgbScoreByHorse).length > 0;
+
+  // Leakage fix (2026-04-30): use date-filtered subqueries instead of
+  // h.total_wins/h.total_starts (which are recomputed post-ingest to include
+  // the same-day race being predicted). wins_pre/starts_pre count results
+  // from meetings strictly before raceDate.
+  const { results } = await db.prepare(`
+    SELECT rr.horse_id, rr.jockey_id, rr.trainer_id,
+           rr.horse_number, rr.draw, rr.win_odds, rr.actual_weight,
+           h.name_ch, h.name_en,
+           (SELECT COUNT(*) FROM race_results rr2
+             JOIN races r2 ON r2.id = rr2.race_id
+             JOIN race_meetings rm2 ON rm2.id = r2.meeting_id
+            WHERE rr2.horse_id = rr.horse_id
+              AND rm2.date < ?
+              AND rr2.finishing_position = 1) AS wins_pre,
+           (SELECT COUNT(*) FROM race_results rr3
+             JOIN races r3 ON r3.id = rr3.race_id
+             JOIN race_meetings rm3 ON rm3.id = r3.meeting_id
+            WHERE rr3.horse_id = rr.horse_id
+              AND rm3.date < ?) AS starts_pre,
+           j.name_ch AS jockey_ch, t.name_ch AS trainer_ch,
+           (SELECT MAX(rm4.date) FROM race_results rr4
+             JOIN races r4 ON r4.id = rr4.race_id
+             JOIN race_meetings rm4 ON rm4.id = r4.meeting_id
+            WHERE rr4.horse_id = rr.horse_id AND rm4.date < ?) AS last_race_date
+    FROM race_results rr
+    JOIN horses h ON h.id = rr.horse_id
+    LEFT JOIN jockeys j ON j.id = rr.jockey_id
+    LEFT JOIN trainers t ON t.id = rr.trainer_id
+    WHERE rr.race_id = ?
+    ORDER BY rr.horse_number
+  `).bind(raceDate, raceDate, raceDate, raceId).all<any>();
+
+  const enriched = await Promise.all((results ?? []).map(async (r: any) => {
+    const hRead = await fetchAxisEloReading(db, 'horse', r.horse_id, raceDate, engine);
+    // Fallback: if jockey_id FK is null, construct snapshot ID from jockey name
+    // (race_results.jockey_name is populated from CSV; ELO snapshots use 'jockey_<name>')
+    const jSnapshotId = r.jockey_id
+      ?? (r.jockey_name ? `jockey_${r.jockey_name}` : null)
+      ?? (r.jockey_ch   ? `jockey_${r.jockey_ch}`   : null);
+    const tSnapshotId = r.trainer_id
+      ?? (r.trainer_name ? `trainer_${r.trainer_name}` : null)
+      ?? (r.trainer_ch   ? `trainer_${r.trainer_ch}`   : null);
+    const jRead = jSnapshotId ? await fetchAxisEloReading(db, 'jockey', jSnapshotId, raceDate, engine) : null;
+    const tRead = tSnapshotId ? await fetchAxisEloReading(db, 'trainer', tSnapshotId, raceDate, engine) : null;
+    const hElo = hRead?.rating ?? null;
+    const jElo = jRead?.rating ?? null;
+    const tElo = tRead?.rating ?? null;
+
+    const parts: number[] = [];
+    if (hElo != null) parts.push(hElo * ELO_WEIGHTS.horse);
+    if (jElo != null) parts.push(jElo * ELO_WEIGHTS.jockey);
+    if (tElo != null) parts.push(tElo * ELO_WEIGHTS.trainer);
+    // Fallback to horse-only if jockey/trainer missing
+    const weightSum = (hElo != null ? ELO_WEIGHTS.horse : 0)
+                    + (jElo != null ? ELO_WEIGHTS.jockey : 0)
+                    + (tElo != null ? ELO_WEIGHTS.trainer : 0);
+    const eloComposite = weightSum > 0
+      ? parts.reduce((a, b) => a + b, 0) / weightSum
+      : null;
+
+    // v1.2 only: weight the final score by horse confidence (reduce softmax weight when provisional)
+    const horseConfidence = hRead?.confidence ?? null;
+    const horseFrozen = hRead?.isFrozen ?? false;
+    const horseRetired = hRead?.isRetired ?? false;
+    const eloEngineUsed: EloEngine = hRead?.engine ?? engine;
+
+    // Recency factor
+    let daysSince: number | null = null;
+    if (r.last_race_date) {
+      const ms = new Date(raceDate).getTime() - new Date(r.last_race_date).getTime();
+      daysSince = Math.round(ms / 86400000);
+    }
+    const recency = recencyBonus(daysSince);
+
+    // Per-race adjustment factors (constitutional spec 2026-04-28)
+    const [fDist, fGoing, fDraw, fWeight, fCond, fInjury, fJT] = await Promise.all([
+      distanceFit(db, r.horse_id, raceDistance, raceDate),
+      goingFit(db, r.horse_id, raceGoing, raceDate),
+      drawBias(db, r.draw, raceVenue, raceDistance, raceDate),
+      weightDelta(db, r.horse_id, r.actual_weight, raceDate),
+      conditionFit(db, r.horse_id, raceDate),
+      injuryFlag(db, r.horse_id, raceDate),
+      jtComboFit(db, r.jockey_id, r.trainer_id, raceDate),
+    ]);
+
+    const factorBreakdown = {
+      recency: { bonus: recency, conf: daysSince != null ? 1 : 0,
+                 note: daysSince != null ? `距上次 ${daysSince} 天` : '無上次紀錄' },
+      distance: fDist,
+      going: fGoing,
+      draw: fDraw,
+      weight: fWeight,
+      condition: fCond,
+      injury: fInjury,
+      jtCombo: fJT,
+    };
+    // R5 ablation (88d / 853 races, 2026-05-10): production keeps only draw + weight.
+      // Other factors retained in factorBreakdown for telemetry but excluded from finalScore.
+      // Reference: reports/decision-log.md "2026-05-10 · R5 88-day ablation".
+      const factorBonus = fDraw.bonus + fWeight.bonus;
+
+    const base = eloComposite != null ? (eloComposite - 1500) / 200 : 0;
+    // winRate computed from pre-race wins/starts only (no same-day leakage).
+    const winRate = r.starts_pre > 0 ? r.wins_pre / r.starts_pre : 0;
+    // Stage 7: prefer LGB score when present, fall back to ELO+factor composite.
+    const lgbScore = lgbScoreByHorse[r.horse_id];
+    const useLgb = lgbScore != null && Number.isFinite(lgbScore);
+    const score = useLgb ? lgbScore : (base + winRate * 1.2 + factorBonus / 100);
+    const finalScore = useLgb
+      ? Math.round(lgbScore * 1000) / 1000
+      : (eloComposite != null ? eloComposite + factorBonus : null);
+
+    return {
+      horse_id: r.horse_id,
+      horse_number: r.horse_number,
+      name_ch: r.name_ch,
+      name_en: r.name_en,
+      jockey_ch: r.jockey_ch,
+      trainer_ch: r.trainer_ch,
+      draw: r.draw,
+      win_odds: r.win_odds,
+      horseElo: hElo,
+      jockeyElo: jElo,
+      trainerElo: tElo,
+      eloComposite,
+      eloEngine: eloEngineUsed,
+      horseConfidence,
+      horseFrozen,
+      horseRetired,
+      factorBonus,
+      factorBreakdown,
+      finalScore,
+      daysSinceLast: daysSince,
+      lgbScore: useLgb ? Math.round(lgbScore * 1000) / 1000 : null,
+      scoreSource: useLgb ? 'lgb' : 'elo',
+      lgbModelVersion: useLgb ? lgbModelVersion : null,
+      _score: score,
+    };
+  }));
+
+  // Plackett-Luce / Harville place probabilities. pWin is identical to the
+  // prior softmax; pTop3/pTop4 are exact Harville (replaces crude min(pWin*3)).
+  // See src/lib/pl-prob.ts (ported from the validated Phase-1 calibration head).
+  const _prob = computeRaceProbabilities(enriched.map((s) => s._score));
+  const withProb = enriched.map((s, i) => {
+    const pWin = _prob.pWin[i];
+    const mkt = s.win_odds && s.win_odds > 1 ? 1 / s.win_odds : null;
+    const valueDelta = mkt != null ? pWin - mkt : null;
+    return {
+      horseId: s.horse_id,
+      horseNumber: s.horse_number,
+      nameCh: s.name_ch,
+      nameEn: s.name_en,
+      jockeyCh: s.jockey_ch,
+      trainerCh: s.trainer_ch,
+      draw: s.draw,
+      winOdds: s.win_odds,
+      horseElo: s.horseElo,
+      jockeyElo: s.jockeyElo,
+      trainerElo: s.trainerElo,
+      eloComposite: s.eloComposite != null ? Math.round(s.eloComposite * 10) / 10 : null,
+      eloEngine: s.eloEngine,
+      horseConfidence: s.horseConfidence != null ? Math.round(s.horseConfidence * 100) / 100 : null,
+      horseFrozen: s.horseFrozen,
+      horseRetired: s.horseRetired,
+      factorBonus: Math.round(s.factorBonus * 10) / 10,
+      factorBreakdown: s.factorBreakdown,
+      finalScore: s.finalScore != null ? Math.round(s.finalScore * 10) / 10 : null,
+      daysSinceLast: s.daysSinceLast,
+      lgbScore: (s as any).lgbScore ?? null,
+      scoreSource: (s as any).scoreSource ?? 'elo',
+      lgbModelVersion: (s as any).lgbModelVersion ?? null,
+      pWin: Math.round(pWin * 1000) / 1000,
+      pTop3: Math.round(_prob.pTop3[i] * 1000) / 1000,
+      pTop4: Math.round(_prob.pTop4[i] * 1000) / 1000,
+      valueDelta: valueDelta != null ? Math.round(valueDelta * 1000) / 1000 : null,
+    };
+  });
+  withProb.sort((a, b) => b.pWin - a.pWin);
+  // Assign rank
+  withProb.forEach((p: any, i: number) => { p.rank = i + 1; });
+  applyProbCalibrationToPicks(withProb as any[], await getProbCalibration(db));
+  return withProb;
+}
+
+// GET /api/analyze/top-picks?raceId=:id&engine=v11|v12 — composite ELO + 7 factors
+// engine defaults to v12 (time-weighted multi-axis, user-endorsed 2026-04-28)
+analyzeRoutes.get('/top-picks', async (c) => {
+  const raceId = c.req.query('raceId');
+  if (!raceId) return c.json({ error: '請提供 raceId' }, 400);
+  const admin = await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER);
+  const engine: EloEngine = admin && c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+
+  const race = await c.env.DB.prepare(`
+    SELECT r.*, rm.date, rm.venue, rm.track_condition
+    FROM races r JOIN race_meetings rm ON rm.id = r.meeting_id
+    WHERE r.id = ? AND rm.venue IN ('ST','HV')
+  `).bind(raceId).first<any>();
+  if (!race) return c.json({ error: '找不到該場賽事' }, 404);
+  if (!admin && !(await publicMayReadRace(c.env.DB, race))) {
+    return c.json({ error: 'active membership required' }, 403);
+  }
+
+  let picks: any[] = [];
+  try {
+    picks = await computeComposite(c.env.DB, raceId, race.date, engine);
+  } catch (err: any) {
+    // Legacy fallback (no ELO / factor engine available)
+    const { results } = await c.env.DB.prepare(`
+      SELECT rr.horse_id, rr.horse_number, rr.draw, rr.win_odds,
+             h.name_ch, h.name_en
+      FROM race_results rr JOIN horses h ON h.id = rr.horse_id
+      WHERE rr.race_id = ? ORDER BY rr.horse_number
+    `).bind(raceId).all<any>();
+    picks = (results ?? []).map((r: any, i: number) => ({
+        horseId: r.horse_id, horseNumber: r.horse_number,
+        nameCh: r.name_ch, nameEn: r.name_en, draw: r.draw, winOdds: r.win_odds,
+        horseElo: null, jockeyElo: null, trainerElo: null,
+        eloComposite: null, factorBonus: 0, finalScore: null,
+        pWin: null, pTop3: null, valueDelta: null, rank: i + 1,
+      }));
+    }
+
+    // Upcoming race fallback: race_results empty → try entries_upcoming (ELO-only ranking)
+    if (!picks.length) {
+      const { results: euRows } = await c.env.DB.prepare(`
+        SELECT e.horse_id, e.horse_number, h.name_ch, h.name_en
+        FROM entries_upcoming e JOIN horses h ON h.id = e.horse_id
+        WHERE e.race_date = ? AND e.venue = ? AND e.venue IN ('ST','HV') AND (e.race_number = ? OR e.race_number IS NULL)
+        ORDER BY e.horse_number
+      `).bind(race.date, race.venue, race.race_number).all<any>().catch(() => ({ results: [] as any[] }));
+      if (euRows?.length) {
+        const euEnriched = await Promise.all((euRows ?? []).map(async (r: any) => {
+          const hRead = await fetchAxisEloReading(c.env.DB, 'horse', r.horse_id, race.date, engine).catch(() => null);
+          return {
+            horseId: r.horse_id, horseNumber: r.horse_number,
+            nameCh: r.name_ch, nameEn: r.name_en, jockeyCh: null, trainerCh: null,
+            draw: null, winOdds: null,
+            horseElo: hRead?.rating != null ? Math.round(hRead.rating * 10) / 10 : null,
+            jockeyElo: null, trainerElo: null,
+            eloComposite: hRead?.rating != null ? Math.round(hRead.rating * 10) / 10 : null,
+            eloEngine: engine, horseConfidence: hRead?.confidence ?? null,
+            horseFrozen: hRead?.isFrozen ?? false, horseRetired: hRead?.isRetired ?? false,
+            factorBonus: 0, factorBreakdown: null,
+            finalScore: hRead?.rating != null ? Math.round(hRead.rating * 10) / 10 : null,
+            daysSinceLast: null, pWin: null, pTop3: null, valueDelta: null, rank: 0,
+          };
+        }));
+        euEnriched.sort((a, b) => (b.horseElo ?? 0) - (a.horseElo ?? 0));
+        euEnriched.forEach((p, i) => { p.rank = i + 1; });
+        picks = euEnriched;
+      }
+    }
+
+    const eloReady = picks.some((p: any) => p.eloComposite != null);
+  const engineInUse = picks.find((p: any) => p.eloEngine)?.eloEngine ?? engine;
+  const payload = {
+    raceId,
+    raceNumber: race.race_number,
+    date: race.date,
+    venue: race.venue,
+    eloReady,
+    eloEngine: engineInUse,
+    eloWeights: ELO_WEIGHTS,
+    picks: picks.slice(0, 5),
+    allPicks: picks, // full field for race page if needed
+    note: eloReady ? null : 'Elo 資料整備中 · 排名暫以勝率+賠率估算',
+  };
+  return c.json(admin ? payload : projectTopPicksForPublic(payload));
+});
+
+// GET /api/analyze/explain?raceId=X&horseId=Y — breakdown for one horse
+analyzeRoutes.get('/explain', async (c) => {
+  const raceId = c.req.query('raceId');
+  const horseId = c.req.query('horseId');
+  if (!raceId || !horseId) return c.json({ error: '請提供 raceId + horseId' }, 400);
+
+  const race = await c.env.DB.prepare(`
+    SELECT r.*, rm.date FROM races r JOIN race_meetings rm ON rm.id = r.meeting_id WHERE r.id = ? AND rm.venue IN ('ST','HV')
+  `).bind(raceId).first<any>();
+  if (!race) return c.json({ error: '找不到該場賽事' }, 404);
+
+  const admin = await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER);
+  if (!admin && !(await publicMayReadRace(c.env.DB, race))) {
+    return c.json({ error: 'active membership required' }, 403);
+  }
+  const engine: EloEngine = admin && c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+  let picks: any[] = [];
+  try {
+    picks = await computeComposite(c.env.DB, raceId, race.date, engine);
+  } catch {
+    return c.json({ error: '無法計算 composite score' }, 500);
+  }
+
+  const pick = picks.find((p: any) => String(p.horseId) === String(horseId));
+  if (!pick) return c.json({ error: '該馬匹不在此場賽事' }, 404);
+
+  // Build human-readable comment with full factor breakdown
+  const lines: string[] = [];
+  if (pick.eloComposite != null) {
+    const engineTag = pick.eloEngine === 'v12' ? 'v1.2' : 'v1.1';
+    const confTag = pick.horseConfidence != null ? ` · 信心 ${Math.round(pick.horseConfidence * 100)}%` : '';
+    const stateTag = pick.horseFrozen ? ' · 馬匹停賽中' : (pick.horseRetired ? ' · 馬匹退役' : '');
+    lines.push(`綜合 ELO ${pick.eloComposite} (${engineTag}${confTag}${stateTag})（馬匹 ${pick.horseElo ?? '—'} × 0.7 + 騎師 ${pick.jockeyElo ?? '—'} × 0.2 + 練馬師 ${pick.trainerElo ?? '—'} × 0.1）`);
+  }
+  const fb = pick.factorBreakdown;
+  if (fb) {
+    const fmtF = (label: string, f: any) => {
+      if (!f || f.conf === 0) return `${label}：${f?.note ?? '—'}`;
+      const sign = f.bonus >= 0 ? '+' : '';
+      return `${label} ${sign}${f.bonus.toFixed(1)}（${f.note}）`;
+    };
+    lines.push(fmtF('途程', fb.distance));
+    lines.push(fmtF('場地', fb.going));
+    lines.push(fmtF('檔位', fb.draw));
+    lines.push(fmtF('負磅', fb.weight));
+    lines.push(fmtF('狀態', fb.condition));
+    lines.push(fmtF('傷患', fb.injury));
+    lines.push(fmtF('騎練配對', fb.jtCombo));
+    lines.push(fmtF('恢復', fb.recency));
+  }
+  if (pick.finalScore != null && pick.eloComposite != null) {
+    lines.push(`最終預測分 ${pick.finalScore}（綜合 ELO ${pick.eloComposite} ${pick.factorBonus >= 0 ? '+' : ''}${pick.factorBonus} 場次調整）`);
+  }
+
+  const payload = {
+    raceId,
+    horseId,
+    rank: pick.rank,
+    horseElo: pick.horseElo,
+    jockeyElo: pick.jockeyElo,
+    trainerElo: pick.trainerElo,
+    eloEngine: pick.eloEngine,
+    horseConfidence: pick.horseConfidence,
+    horseFrozen: pick.horseFrozen,
+    horseRetired: pick.horseRetired,
+    eloWeights: ELO_WEIGHTS,
+    eloComposite: pick.eloComposite,
+    factorBonus: pick.factorBonus,
+    factorBreakdown: pick.factorBreakdown,
+    finalScore: pick.finalScore,
+    pWin: pick.pWin,
+    pTop3: pick.pTop3,
+    pTop4: pick.pTop4,
+    valueDelta: pick.valueDelta,
+    daysSinceLast: pick.daysSinceLast,
+    comment: lines.join(' · '),
+  };
+  return c.json(admin ? payload : projectExplainForPublic(payload));
+});
+
+// Public factor details are intentionally unavailable. The model's inputs,
+// weights, diagnostics and rejected research stay behind the internal boundary.
+analyzeRoutes.get('/factors', (c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Batch ELO / factor helpers for today-picks (single D1 query per dimension)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  async function batchEloReadings(
+    db: D1Database,
+    entityTable: 'horse' | 'jockey' | 'trainer',
+    ids: string[],
+    asOf: string,
+    engine: EloEngine,
+  ): Promise<Map<string, EloReading>> {
+    const map = new Map<string, EloReading>();
+    if (!ids.length) return map;
+    const col = `${entityTable}_id`;
+    const table = `${entityTable}_elo_snapshots`;
+    // D1 bind-param limit = 100 per statement; chunk IDs into batches of 80 (1 slot reserved for asOf)
+    const CHUNK = 80;
+    const chunks: string[][] = [];
+    for (let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK));
+    // Use ORDER BY + JS first-per-entity (avoids problematic INNER JOIN subquery in D1)
+    if (engine === 'v12') {
+      for (const chunk of chunks) {
+        try {
+          const ph = chunk.map(() => '?').join(', ');
+          const { results } = await db.prepare(
+            `SELECT ${col}, rating, confidence, is_frozen, is_retired, is_provisional
+             FROM ${table}
+             WHERE ${col} IN (${ph})${entityTable === 'horse' ? " AND axis_key = 'overall'" : ''} AND as_of_date <= ? AND id LIKE 'v12:%'
+             ORDER BY ${col}, as_of_date DESC`
+          ).bind(...chunk, asOf).all<any>();
+          for (const row of (results ?? [])) {
+            if (!map.has(row[col])) map.set(row[col], { rating: row.rating, confidence: row.confidence ?? null, isFrozen: !!row.is_frozen, isRetired: !!row.is_retired, isProvisional: !!row.is_provisional, engine: 'v12' });
+          }
+        } catch { /* v12 columns missing or query error — try v11 fallback below */ }
+      }
+    }
+    const missing = ids.filter(id => !map.has(id));
+    if (missing.length) {
+      const chunks2: string[][] = [];
+      for (let i = 0; i < missing.length; i += CHUNK) chunks2.push(missing.slice(i, i + CHUNK));
+      for (const chunk of chunks2) {
+        try {
+          const ph2 = chunk.map(() => '?').join(', ');
+          const { results } = await db.prepare(
+            `SELECT ${col}, rating
+             FROM ${table}
+             WHERE ${col} IN (${ph2})${entityTable === 'horse' ? " AND axis_key = 'overall'" : ''} AND as_of_date <= ? AND id NOT LIKE 'v12:%'
+             ORDER BY ${col}, as_of_date DESC`
+          ).bind(...chunk, asOf).all<any>();
+          for (const row of (results ?? [])) {
+            if (!map.has(row[col])) map.set(row[col], { rating: row.rating, confidence: null, isFrozen: false, isRetired: false, isProvisional: false, engine: 'v11' });
+          }
+        } catch { /* skip */ }
+      }
+    }
+    return map;
+  }
+
+  async function batchLastRaceDate(db: D1Database, horseIds: string[], asOf: string): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!horseIds.length) return map;
+    const CHUNK = 80;
+    for (let i = 0; i < horseIds.length; i += CHUNK) {
+      const chunk = horseIds.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(', ');
+      try {
+      const { results } = await db.prepare(
+        `SELECT rr.horse_id, MAX(rm.date) AS last_date
+         FROM race_results rr JOIN races r ON r.id = rr.race_id JOIN race_meetings rm ON rm.id = r.meeting_id
+         WHERE rr.horse_id IN (${ph}) AND rm.date < ?
+         GROUP BY rr.horse_id`
+      ).bind(...chunk, asOf).all<any>();
+      for (const row of (results ?? [])) map.set(row.horse_id, row.last_date);
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  async function batchDistanceFit(db: D1Database, horseIds: string[], asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    if (!horseIds.length) return map;
+    const CHUNK = 80;
+    for (let i = 0; i < horseIds.length; i += CHUNK) {
+      const chunk = horseIds.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(', ');
+      try {
+      const { results } = await db.prepare(
+        `SELECT rr.horse_id, (ROUND(r.distance / 200.0) * 200) AS bucket,
+                SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3, COUNT(*) AS starts
+         FROM race_results rr JOIN races r ON r.id = rr.race_id JOIN race_meetings rm ON rm.id = r.meeting_id
+         WHERE rr.horse_id IN (${ph}) AND rm.date < ?
+           AND rr.finishing_position > 0 AND rr.finishing_position < 99 AND r.distance > 0
+         GROUP BY rr.horse_id, bucket`
+      ).bind(...chunk, asOf).all<any>();
+      for (const row of (results ?? [])) {
+        const starts = row.starts ?? 0; if (starts < 2) continue;
+        const top3Rate = (row.top3 ?? 0) / starts;
+        map.set(`${row.horse_id}:${row.bucket}`, { bonus: Math.max(-20, Math.min(20, (top3Rate - 0.3) * 50)), conf: Math.min(1, starts / 5), note: `${row.bucket}m 歷往 ${starts} 戰 ${row.top3 ?? 0}上 (${Math.round(top3Rate * 100)}%)` });
+      }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  async function batchGoingFit(db: D1Database, horseIds: string[], asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    if (!horseIds.length) return map;
+    const CHUNK = 80;
+    for (let i = 0; i < horseIds.length; i += CHUNK) {
+      const chunk = horseIds.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(', ');
+      try {
+      const { results } = await db.prepare(
+        `SELECT rr.horse_id, r.going,
+                SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3, COUNT(*) AS starts
+         FROM race_results rr JOIN races r ON r.id = rr.race_id JOIN race_meetings rm ON rm.id = r.meeting_id
+         WHERE rr.horse_id IN (${ph}) AND rm.date < ?
+           AND rr.finishing_position > 0 AND rr.finishing_position < 99
+         GROUP BY rr.horse_id, r.going`
+      ).bind(...chunk, asOf).all<any>();
+      for (const row of (results ?? [])) {
+        if (!row.going) continue; const starts = row.starts ?? 0; if (starts < 2) continue;
+        const top3Rate = (row.top3 ?? 0) / starts;
+        map.set(`${row.horse_id}:${row.going}`, { bonus: Math.max(-15, Math.min(15, (top3Rate - 0.3) * 40)), conf: Math.min(1, starts / 4), note: `${row.going} ${starts} 戰 ${row.top3 ?? 0}上 (${Math.round(top3Rate * 100)}%)` });
+      }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  async function batchDrawBias(db: D1Database, entries: any[], venue: string, asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    const buckets = [...new Set(entries.map(e => distBucket(e.distance)).filter(Boolean) as number[])];
+    for (const bucket of buckets) {
+      try {
+        const { results } = await db.prepare(
+          `SELECT rr.draw,
+                  SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3, COUNT(*) AS starts
+           FROM race_results rr JOIN races r ON r.id = rr.race_id JOIN race_meetings rm ON rm.id = r.meeting_id
+           WHERE rm.venue = ? AND rm.date < ? AND r.distance BETWEEN ? AND ?
+             AND rr.draw IS NOT NULL AND rr.draw > 0
+             AND rr.finishing_position > 0 AND rr.finishing_position < 99
+           GROUP BY rr.draw`
+        ).bind(venue, asOf, bucket - 100, bucket + 100).all<any>();
+        for (const row of (results ?? [])) {
+          const starts = row.starts ?? 0; if (starts < 20) continue;
+          const top3Rate = (row.top3 ?? 0) / starts;
+          map.set(`${row.draw}:${venue}:${bucket}`, { bonus: Math.max(-10, Math.min(10, (top3Rate - 0.25) * 60)), conf: Math.min(1, starts / 80), note: `檔${row.draw} ${venue}/${bucket}m 歷年 ${Math.round(top3Rate * 100)}% 上位率` });
+        }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  // 檔位效應 v2：場地 × 賽道(rail) × 路程分層；期望上位率用每場實際馬匹數（3/場數）而非固定 0.25；
+  // 樣本細時以經驗貝葉斯向「同場地同路程」再向中性 1.0 收縮，避免細格雜訊。
+  async function batchDrawBiasV2(db: D1Database, entries: any[], venue: string, asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    const buckets = [...new Set(entries.map(e => distBucket(e.distance)).filter(Boolean) as number[])];
+    const K_BASE = 15, K_RAIL = 12, SCALE = 25;
+    for (const bucket of buckets) {
+      try {
+        const { results } = await db.prepare(
+          `WITH f AS (
+             SELECT rr.race_id AS rid, COUNT(*) AS n FROM race_results rr
+             WHERE rr.finishing_position > 0 AND rr.finishing_position < 99 GROUP BY rr.race_id
+           )
+           SELECT rr.draw AS draw, r.course AS course,
+                  COUNT(*) AS starts,
+                  SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3,
+                  SUM(3.0 / f.n) AS exp3
+           FROM race_results rr
+           JOIN races r ON r.id = rr.race_id
+           JOIN race_meetings rm ON rm.id = r.meeting_id
+           JOIN f ON f.rid = rr.race_id
+           WHERE rm.venue = ? AND rm.date < ? AND r.distance BETWEEN ? AND ?
+             AND rr.draw IS NOT NULL AND rr.draw > 0
+             AND rr.finishing_position > 0 AND rr.finishing_position < 99
+           GROUP BY rr.draw, r.course`
+        ).bind(venue, asOf, bucket - 100, bucket + 100).all<any>();
+        const base = new Map<number, { starts: number; top3: number; exp3: number }>();
+        const rail = new Map<string, { starts: number; top3: number; exp3: number; draw: number; rk: string }>();
+        for (const row of (results ?? [])) {
+          const d = Number(row.draw); if (!Number.isFinite(d) || d <= 0) continue;
+          const st = Number(row.starts) || 0, t3 = Number(row.top3) || 0, e3 = Number(row.exp3) || 0;
+          const b = base.get(d) ?? { starts: 0, top3: 0, exp3: 0 };
+          b.starts += st; b.top3 += t3; b.exp3 += e3; base.set(d, b);
+          const rk = railKey(row.course);
+          const key = `${d}|${rk}`;
+          const r = rail.get(key) ?? { starts: 0, top3: 0, exp3: 0, draw: d, rk };
+          r.starts += st; r.top3 += t3; r.exp3 += e3; rail.set(key, r);
+        }
+        const baseLift = new Map<number, number>();
+        for (const [d, b] of base) {
+          if (b.starts < 20 || !(b.exp3 > 0)) continue;
+          baseLift.set(d, (b.top3 + K_BASE) / (b.exp3 + K_BASE));
+        }
+        for (const [d, lift] of baseLift) {
+          const b = base.get(d)!;
+          map.set(`${d}:${venue}:${bucket}`, {
+            bonus: Math.max(-10, Math.min(10, (lift - 1) * SCALE)),
+            conf: Math.min(1, b.starts / 80),
+            note: `檔${d} ${venue}/${bucket}m 上位指數 ${lift.toFixed(2)}（${b.starts} 戰）`,
+          });
+        }
+        for (const r of rail.values()) {
+          if (r.starts < 12 || !(r.exp3 > 0)) continue;
+          const prior = baseLift.get(r.draw) ?? 1;
+          const lift = (r.top3 + K_RAIL * prior) / (r.exp3 + K_RAIL);
+          map.set(`${r.draw}:${venue}:${bucket}:${r.rk}`, {
+            bonus: Math.max(-10, Math.min(10, (lift - 1) * SCALE)),
+            conf: Math.min(1, r.starts / 60),
+            note: `檔${r.draw} ${venue}/${bucket}m/${r.rk} 賽道上位指數 ${lift.toFixed(2)}（${r.starts} 戰）`,
+          });
+        }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  // 檔位效應 v3：在 v2（場地×賽道×路程）之上再加三個分層 —— 場地狀況(going)、出賽匹數(field size)、班次(class)。
+  async function batchDrawBiasV3(db: D1Database, entries: any[], venue: string, asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    const buckets = [...new Set(entries.map(e => distBucket(e.distance)).filter(Boolean) as number[])];
+    const K_BASE = 15, K_SUB = 12, SCALE = 25;
+    type Agg = { starts: number; top3: number; exp3: number };
+    const add = (m: Map<string, Agg>, k: string, st: number, t3: number, e3: number) => {
+      const a = m.get(k) ?? { starts: 0, top3: 0, exp3: 0 };
+      a.starts += st; a.top3 += t3; a.exp3 += e3; m.set(k, a);
+    };
+    for (const bucket of buckets) {
+      try {
+        const { results } = await db.prepare(
+          `WITH f AS (
+             SELECT rr.race_id AS rid, COUNT(*) AS n FROM race_results rr
+             WHERE rr.finishing_position > 0 AND rr.finishing_position < 99 GROUP BY rr.race_id
+           )
+           SELECT rr.draw AS draw, r.course AS course, r.going AS going, r.class AS cls, f.n AS field,
+                  COUNT(*) AS starts,
+                  SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3,
+                  SUM(3.0 / f.n) AS exp3
+           FROM race_results rr
+           JOIN races r ON r.id = rr.race_id
+           JOIN race_meetings rm ON rm.id = r.meeting_id
+           JOIN f ON f.rid = rr.race_id
+           WHERE rm.venue = ? AND rm.date < ? AND r.distance BETWEEN ? AND ?
+             AND rr.draw IS NOT NULL AND rr.draw > 0
+             AND rr.finishing_position > 0 AND rr.finishing_position < 99
+           GROUP BY rr.draw, r.course, r.going, r.class, f.n`
+        ).bind(venue, asOf, bucket - 100, bucket + 100).all<any>();
+        const base = new Map<string, Agg>();
+        const layers: Record<'r' | 'g' | 'f' | 'c', Map<string, Agg>> = {
+          r: new Map(), g: new Map(), f: new Map(), c: new Map(),
+        };
+        for (const row of (results ?? [])) {
+          const d = Number(row.draw); if (!Number.isFinite(d) || d <= 0) continue;
+          const st = Number(row.starts) || 0, t3 = Number(row.top3) || 0, e3 = Number(row.exp3) || 0;
+          add(base, String(d), st, t3, e3);
+          const rk = railKey(row.course); if (rk !== 'NA') add(layers.r, `${d}|${rk}`, st, t3, e3);
+          const gk = goingKey(row.going); if (gk !== 'NA') add(layers.g, `${d}|${gk}`, st, t3, e3);
+          const fk = fieldKey(row.field); if (fk !== 'NA') add(layers.f, `${d}|${fk}`, st, t3, e3);
+          const ck = classKey(row.cls); if (ck !== 'NA') add(layers.c, `${d}|${ck}`, st, t3, e3);
+        }
+        const baseLift = new Map<string, number>();
+        for (const [d, b] of base) {
+          if (b.starts < 20 || !(b.exp3 > 0)) continue;
+          const lift = (b.top3 + K_BASE) / (b.exp3 + K_BASE);
+          baseLift.set(d, lift);
+          map.set(`${d}:${venue}:${bucket}`, {
+            bonus: Math.max(-10, Math.min(10, (lift - 1) * SCALE)),
+            conf: Math.min(1, b.starts / 80),
+            note: `檔${d} ${venue}/${bucket}m 上位指數 ${lift.toFixed(2)}（${b.starts} 戰）`,
+          });
+        }
+        const labels: Record<'r' | 'g' | 'f' | 'c', string> = { r: '賽道', g: '地質', f: '匹數', c: '班次' };
+        for (const tag of ['r', 'g', 'f', 'c'] as const) {
+          for (const [key, a] of layers[tag]) {
+            if (a.starts < 12 || !(a.exp3 > 0)) continue;
+            const [dStr, sub] = key.split('|') as [string, string];
+            const prior = baseLift.get(dStr) ?? 1;
+            const lift = (a.top3 + K_SUB * prior) / (a.exp3 + K_SUB);
+            map.set(`${dStr}:${venue}:${bucket}:${tag}:${sub}`, {
+              bonus: Math.max(-10, Math.min(10, (lift - 1) * SCALE)),
+              conf: Math.min(1, a.starts / 60),
+              note: `檔${dStr} ${venue}/${bucket}m/${labels[tag]}${sub} 上位指數 ${lift.toFixed(2)}（${a.starts} 戰）`,
+            });
+          }
+        }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  // 依檔位模型版本取出檔位因子（v3 會合成賽道／地質／匹數／班次四層）。
+  function resolveDrawFactor(
+    model: DrawModel,
+    drawMap: Map<string, FactorResult>,
+    baseKey: string,
+    ctx: { course: string | null; going: string | null; fieldSize: number | null; raceClass: string | null },
+  ): FactorResult {
+    const fallback: FactorResult = { bonus: 0, conf: 0, note: '檔位資料不全' };
+    const baseHit = drawMap.get(baseKey);
+    if (model !== 'v3') {
+      return drawMap.get(`${baseKey}:${railKey(ctx.course)}`) ?? baseHit ?? fallback;
+    }
+    const subs: Array<[string, string]> = [
+      ['r', railKey(ctx.course)],
+      ['g', goingKey(ctx.going)],
+      ['f', fieldKey(ctx.fieldSize)],
+      ['c', classKey(ctx.raceClass)],
+    ];
+    let wSum = 0, bSum = 0; const notes: string[] = [];
+    for (const [tag, sub] of subs) {
+      if (sub === 'NA') continue;
+      const hit = drawMap.get(`${baseKey}:${tag}:${sub}`);
+      if (!hit) continue;
+      const w = Math.max(0.05, hit.conf ?? 0);
+      wSum += w; bSum += w * hit.bonus;
+      notes.push(hit.note);
+    }
+    if (baseHit) {
+      const w = Math.max(0.1, baseHit.conf ?? 0);
+      wSum += w; bSum += w * baseHit.bonus;
+      if (!notes.length) notes.push(baseHit.note);
+    }
+    if (!wSum) return fallback;
+    return {
+      bonus: Math.max(-10, Math.min(10, bSum / wSum)),
+      conf: Math.min(1, wSum / 2),
+      note: notes.slice(0, 3).join('；'),
+    };
+  }
+
+
+
+  async function batchConditionFit(db: D1Database, horseIds: string[], asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    if (!horseIds.length) return map;
+    const CHUNK = 80;
+    for (let i = 0; i < horseIds.length; i += CHUNK) {
+      const chunk = horseIds.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(', ');
+      try {
+      const { results } = await db.prepare(
+        `SELECT horse_id, COUNT(*) AS sessions
+         FROM horse_trackwork
+         WHERE horse_id IN (${ph}) AND trackwork_date >= date(?, '-14 days') AND trackwork_date < ?
+         GROUP BY horse_id`
+      ).bind(...chunk, asOf, asOf).all<any>();
+      for (const row of (results ?? [])) {
+        const n = row.sessions ?? 0; let bonus = 0;
+        if (n >= 4 && n <= 6) bonus = 8; else if (n >= 2 && n <= 8) bonus = 3; else if (n === 1) bonus = -3; else if (n > 8) bonus = -5;
+        map.set(row.horse_id, { bonus, conf: Math.min(1, n / 4), note: `14 天 ${n} 課晨操` });
+      }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  async function batchInjuryFlag(db: D1Database, horseIds: string[], asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    if (!horseIds.length) return map;
+    const CHUNK = 80;
+    for (let i = 0; i < horseIds.length; i += CHUNK) {
+      const chunk = horseIds.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(', ');
+      try {
+      const { results } = await db.prepare(
+        `SELECT horse_id, injury_date, resolution_date, injury_type
+         FROM horse_injury
+         WHERE horse_id IN (${ph}) AND injury_date < ? AND injury_date >= date(?, '-180 days')
+         ORDER BY horse_id, injury_date DESC`
+      ).bind(...chunk, asOf, asOf).all<any>();
+      const seen = new Set<string>();
+      for (const row of (results ?? [])) {
+        if (seen.has(row.horse_id)) continue; seen.add(row.horse_id);
+        const daysAgo = Math.max(1, Math.round((new Date(asOf).getTime() - new Date(row.injury_date).getTime()) / 86400000));
+        const unresolved = !row.resolution_date;
+        const decayed = (unresolved ? -15 : -10) * Math.exp(-daysAgo / 45);
+        map.set(row.horse_id, { bonus: Math.max(-15, Math.min(0, decayed)), conf: Math.min(1, 1 - daysAgo / 180), note: `${daysAgo} 天前${row.injury_type ?? '傷病'}${unresolved ? ' (未復原)' : ''}` });
+      }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  async function batchJtComboFit(db: D1Database, entries: any[], asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    const prefix = (raw: string, kind: 'jockey' | 'trainer') => raw.startsWith(`${kind}_`) ? raw : `${kind}_${raw}`;
+      const pairs = [...new Set(entries.filter(e => (e.jockey_id || e.jockey_name) && (e.trainer_id || e.trainer_name)).map(e => `${prefix(e.jockey_id ?? e.jockey_name, 'jockey')}|${prefix(e.trainer_id ?? e.trainer_name, 'trainer')}`))].map(s => s.split('|') as [string, string]);
+    for (const [jId, tId] of pairs) {
+      try {
+        const row = await db.prepare(
+          `SELECT COUNT(*) AS starts, SUM(CASE WHEN rr.finishing_position BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3
+           FROM race_results rr JOIN races r ON r.id = rr.race_id JOIN race_meetings rm ON rm.id = r.meeting_id
+           WHERE rr.jockey_id = ? AND rr.trainer_id = ? AND rm.date < ?
+             AND rr.finishing_position > 0 AND rr.finishing_position < 99`
+        ).bind(jId, tId, asOf).first<any>();
+        const starts = row?.starts ?? 0;
+        if (starts >= 10) { const top3Rate = (row?.top3 ?? 0) / starts; map.set(`${jId}:${tId}`, { bonus: Math.max(-12, Math.min(12, (top3Rate - 0.25) * 40)), conf: Math.min(1, starts / 30), note: `配對 ${starts} 戰 ${row.top3 ?? 0}上 (${Math.round(top3Rate * 100)}%)` }); }
+        else { map.set(`${jId}:${tId}`, { bonus: 0, conf: 0, note: `配對 ${starts} 戰樣本不足` }); }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+  async function batchWeightDelta(db: D1Database, horseIds: string[], entries: any[], asOf: string): Promise<Map<string, FactorResult>> {
+    const map = new Map<string, FactorResult>();
+    if (!horseIds.length) return map;
+    const CHUNK = 80;
+    for (let i = 0; i < horseIds.length; i += CHUNK) {
+      const chunk = horseIds.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(', ');
+      try {
+      const { results } = await db.prepare(
+        `SELECT rr.horse_id, rr.actual_weight
+         FROM race_results rr JOIN races r ON r.id = rr.race_id JOIN race_meetings rm ON rm.id = r.meeting_id
+         INNER JOIN (
+           SELECT rr2.horse_id, MAX(rm2.date) AS max_date
+           FROM race_results rr2 JOIN races r2 ON r2.id = rr2.race_id JOIN race_meetings rm2 ON rm2.id = r2.meeting_id
+           WHERE rr2.horse_id IN (${ph}) AND rm2.date < ? GROUP BY rr2.horse_id
+         ) latest ON rr.horse_id = latest.horse_id AND rm.date = latest.max_date
+         WHERE rr.actual_weight IS NOT NULL`
+      ).bind(...chunk, asOf).all<any>();
+      const lastWtMap = new Map<string, number>();
+      for (const row of (results ?? [])) lastWtMap.set(row.horse_id, row.actual_weight);
+      const nowWtMap = new Map(entries.map(e => [e.horse_id ?? e.horse_code, e.declared_weight ?? e.actual_weight]));
+      for (const horseId of horseIds) {
+        const last = lastWtMap.get(horseId); const now = nowWtMap.get(horseId);
+        if (!last || !now || Math.abs(now - last) < 1) continue;
+        const delta = now - last;
+        map.set(horseId, { bonus: Math.max(-10, Math.min(5, delta > 0 ? -delta * 2 : -delta * 1.5)), conf: 0.7, note: `體重 ${delta > 0 ? '+' : ''}${delta}磅 (${last}→${now})` });
+      }
+      } catch { /* skip */ }
+    }
+    return map;
+  }
+
+    // ── TX-Oracle v3 (2026-05-21) ────────────────────────────────────────
+    // Ensemble α (LGB weight) loader. Default 0.62 (LGB-leaning but ELO
+    // retains meaningful say). Override via app_settings (key='ensemble_alpha')
+    // — written by /admin/api/ensemble-tune after backtest grid search.
+    export async function getEnsembleAlpha(db: D1Database): Promise<number> {
+      try {
+        await db.prepare(
+          `CREATE TABLE IF NOT EXISTS app_settings (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+           )`
+        ).run().catch(() => {});
+        const row = await db.prepare(
+          `SELECT value FROM app_settings WHERE key = 'ensemble_alpha'`
+        ).first<{ value: string }>().catch(() => null);
+        if (row?.value) {
+          const n = Number(row.value);
+          if (Number.isFinite(n) && n >= 0 && n <= 1) return n;
+        }
+      } catch { /* ignore */ }
+      return 0.62;
+    }
+
+    // ── Stage 2 (2026-09-10): probability calibration ────────────────────
+    // Platt scaling fitted on frozen prediction_log rows and stored in
+    // app_settings(key='prob_calibration'). Applied to pTop3 / pTop4 only —
+    // pWin is already well calibrated (ECE ~1.4%) and must keep summing to 1
+    // across the field, while pTop3 was over-confident in the high band.
+    // The mapping is strictly increasing so pick order never changes.
+    export async function getProbCalibration(db: D1Database): Promise<StoredCalibration | null> {
+      try {
+        await db.prepare(
+          `CREATE TABLE IF NOT EXISTS app_settings (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+           )`
+        ).run().catch(() => {});
+        const row = await db.prepare(
+          `SELECT value FROM app_settings WHERE key = 'prob_calibration'`
+        ).first<{ value: string }>().catch(() => null);
+        return parseCalibration(row?.value);
+      } catch {
+        return null;
+      }
+    }
+
+    /** In-place: overwrite pTop3/pTop4 with calibrated values, keep raw copies. */
+    export function applyProbCalibrationToPicks(picks: any[], calib: StoredCalibration | null): boolean {
+      const t3 = calib?.top3 ?? null;
+      const bands = calib?.bands ?? null;
+      if ((!t3 && !bands) || !Array.isArray(picks) || !picks.length) return false;
+      for (const p of picks) {
+        if (p == null) continue;
+        // Segmented calibration: pick the curve for this runner's market band
+        // and fall back to the global curve when that band was not fitted.
+        const bk = bands ? bandForOdds(p.winOdds ?? p.win_odds ?? null) : null;
+        const params: PlattParams | null = (bk && bands?.[bk]) ? bands[bk]! : t3;
+        if (!params) continue;
+        if (p.pTop3 != null) {
+          p.pTop3Raw = p.pTop3;
+          const cal = applyPlatt(p.pTop3, params);
+          p.pTop3 = Math.round(Math.max(p.pWin ?? 0, cal) * 1000) / 1000;
+        }
+        if (p.pTop4 != null) {
+          p.pTop4Raw = p.pTop4;
+          const cal4 = applyPlatt(p.pTop4, params);
+          p.pTop4 = Math.round(Math.max(p.pTop3 ?? 0, cal4) * 1000) / 1000;
+        }
+        p.probCalibrated = true;
+        p.probCalibBand = bk ?? 'global';
+      }
+      return true;
+    }
+
+    /** In-place over a list of race prediction objects. */
+    export function applyProbCalibration(races: any[], calib: StoredCalibration | null): boolean {
+      let applied = false;
+      for (const r of (races || [])) {
+        if (applyProbCalibrationToPicks(r?.picks ?? [], calib)) applied = true;
+      }
+      return applied;
+    }
+
+
+    // Apply TX-Oracle v3 ensemble in-place on enriched picks (P0 + P1).
+    // - When ANY runner has LGB: z-blend (α·lgb_z + (1-α)·elo_z) for the
+    //   whole race. Missing-LGB runners impute lgb_z = 0 (race mean →
+    //   neutral). Preserves softmax pWin coherence.
+    // - When NO runner has LGB: leave _score/finalScore from elo+factor.
+    export function applyEnsembleBlend(
+      enriched: any[],
+      alpha: number,
+      lgbScoreByRaceHorse: Map<string, { score: number; pWin: number | null; modelVersion: string | null }>,
+      lgbLookupRaceId: string,
+    ): { raceHasLgb: boolean; lgbHits: number; lgbModelVerForRace: string | null } {
+      let lgbHits = 0;
+      let lgbModelVerForRace: string | null = null;
+      const lgbVals: number[] = [];
+      const eloVals: number[] = [];
+      for (const s of enriched) {
+        const lgb = s.horseId ? lgbScoreByRaceHorse.get(`${lgbLookupRaceId}::${s.horseId}`) : undefined;
+        if (lgb && Number.isFinite(lgb.score)) {
+          (s as any).__lgb = lgb;
+          lgbVals.push(lgb.score);
+          lgbHits++;
+          if (!lgbModelVerForRace) lgbModelVerForRace = lgb.modelVersion;
+        }
+        if (s.eloComposite != null && Number.isFinite(s.eloComposite)) eloVals.push(s.eloComposite as number);
+      }
+      const raceHasLgb = lgbHits > 0;
+      if (!raceHasLgb) {
+        for (const s of enriched) s.scoreSource = 'elo+factor';
+        return { raceHasLgb, lgbHits, lgbModelVerForRace };
+      }
+      const ms = (arr: number[]) => {
+        if (arr.length < 2) return { m: arr[0] ?? 0, s: 1 };
+        const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+        const v = arr.reduce((a, b) => a + (b - m) * (b - m), 0) / (arr.length - 1);
+        return { m, s: Math.sqrt(v) || 1 };
+      };
+      const { m: lgbMean, s: lgbStd } = ms(lgbVals);
+      const { m: eloMean, s: eloStd } = ms(eloVals);
+      const aStr = alpha.toFixed(2);
+      for (const s of enriched) {
+        const lgb = (s as any).__lgb;
+        delete (s as any).__lgb;
+        const eloZ = (s.eloComposite != null && Number.isFinite(s.eloComposite))
+          ? (s.eloComposite - eloMean) / eloStd : 0;
+        const lgbZ = lgb ? (lgb.score - lgbMean) / lgbStd : 0; // impute race mean
+        const blendZ = alpha * lgbZ + (1 - alpha) * eloZ;
+        // factorTilt kept at 0.5× weight: empirical A/B (2026-05-21 5-20 backtest)
+        // showed removing it dropped top-1 from 55.6%→33.3%. LGB *should* subsume
+        // draw/weight but in practice factorBonus provides complementary recent
+        // draw-bias signal LGB's training data missed. DO NOT REMOVE without rerunning backtest.
+        const factorTilt = (s.factorBonus || 0) / 100;
+        s._score = blendZ + factorTilt * 0.5;
+        s.lgbScore = lgb ? Math.round(lgb.score * 1000) / 1000 : null;
+        s.lgbModelVersion = lgb ? lgb.modelVersion : null;
+        s.ensembleAlpha = alpha;
+        s.scoreSource = lgb
+          ? `tx-oracle-v3 (ensemble α=${aStr})`
+          : `tx-oracle-v3 (lgb-imputed α=${aStr})`;
+        s.finalScore = Math.round((1500 + blendZ * 100) * 10) / 10;
+      }
+      return { raceHasLgb, lgbHits, lgbModelVerForRace };
+    }
+
+      // ── attachRaceQuality: relative WITHIN-DAY race ranking by box coverage ──
+      // expectedBoxCoverage is the model's analytic estimate, which UNDER-predicts
+      // realized coverage by ~1-4pp → it is ONLY meaningful as a same-day RELATIVE
+      // signal (揀場), never an absolute probability. Primary metric = trio_n4
+      // (任序首3 box of the model's top-4) = the north-star top-4 box use case.
+      // Tie-break first4_n4, then race number. Tier = within-day terciles (高/中/低).
+      // ADDITIVE: writes only a new raceQuality field; picks/pWin/coverage untouched.
+      function attachRaceQuality(racePredictions: any[]): void {
+        for (const r of racePredictions) r.raceQuality = null;
+        const ranked = racePredictions
+          .map((r) => ({
+            r,
+            m: (r.expectedBoxCoverage && typeof r.expectedBoxCoverage.trio_n4 === 'number') ? r.expectedBoxCoverage.trio_n4 as number : null,
+            m2: (r.expectedBoxCoverage && typeof r.expectedBoxCoverage.first4_n4 === 'number') ? r.expectedBoxCoverage.first4_n4 as number : 0,
+          }))
+          .filter((x): x is { r: any; m: number; m2: number } => x.m != null);
+        const total = ranked.length;
+        if (!total) return;
+        ranked.sort((a, b) => (b.m - a.m) || (b.m2 - a.m2) || ((a.r.raceNumber ?? 0) - (b.r.raceNumber ?? 0)));
+        const third = Math.ceil(total / 3);
+        ranked.forEach((x, i) => {
+          const rank = i + 1;
+          const tier = rank <= third ? '高' : rank > total - third ? '低' : '中';
+          x.r.raceQuality = { rank, total, tier, metric: 'trio_n4', score: Math.round(x.m * 1000) / 1000 };
+        });
+      }
+
+    // ── computePicksFromEntries: shared helper for today-picks / picks-by-date / hit-rate ──
+      async function computePicksFromEntries(
+        db: D1Database,
+        targetDate: string,
+        meeting: any,
+        entries: any[],
+        engine: EloEngine,
+        alphaOverride?: number,
+        eloWeightsOverride?: EloWeights,
+        drawModelOverride?: DrawModel,
+        drawScaleOverride?: number,
+      ): Promise<any> {
+        const DRAW_MODEL: DrawModel = drawModelOverride ?? await getDrawModel(db);
+        const DRAW_SCALE: number = (typeof drawScaleOverride === 'number' && Number.isFinite(drawScaleOverride) && drawScaleOverride > 0)
+          ? Math.min(200, drawScaleOverride) : 1;
+        const effectiveAlpha = (typeof alphaOverride === 'number' && Number.isFinite(alphaOverride) && alphaOverride >= 0 && alphaOverride <= 1)
+          ? alphaOverride : await getEnsembleAlpha(db);
+        const EW: EloWeights = normalizeEloWeights(eloWeightsOverride) ?? await getEloWeights(db);
+        const prefixId = (raw: string | null | undefined, kind: 'horse' | 'jockey' | 'trainer'): string | null => {
+          if (!raw) return null;
+          const p = kind + '_';
+          return raw.startsWith(p) ? raw : p + raw;
+        };
+        const allHorseIds = [...new Set(entries.map(e => prefixId(e.horse_id ?? e.horse_code, 'horse')).filter(Boolean) as string[])];
+        const horseEloIds = allHorseIds;
+        const allJockeyIds = [...new Set(entries.map(e => prefixId(e.jockey_id ?? e.jockey_name, 'jockey')).filter(Boolean) as string[])];
+        const allTrainerIds = [...new Set(entries.map(e => prefixId(e.trainer_id ?? e.trainer_name, 'trainer')).filter(Boolean) as string[])];
+        const [horseEloMap, jockeyEloMap, trainerEloMap, recencyMap, distMap, goingMap, drawMap, condMap, injMap, wtMap, jtMap] = await Promise.all([
+          batchEloReadings(db, 'horse', horseEloIds, targetDate, engine),
+          batchEloReadings(db, 'jockey', allJockeyIds, targetDate, engine),
+          batchEloReadings(db, 'trainer', allTrainerIds, targetDate, engine),
+          batchLastRaceDate(db, allHorseIds, targetDate),
+          batchDistanceFit(db, allHorseIds, targetDate),
+          batchGoingFit(db, allHorseIds, targetDate),
+          (DRAW_MODEL === 'v3' ? batchDrawBiasV3 : DRAW_MODEL === 'v2' ? batchDrawBiasV2 : batchDrawBias)(db, entries, meeting.venue, targetDate),
+          batchConditionFit(db, allHorseIds, targetDate),
+          batchInjuryFlag(db, allHorseIds, targetDate),
+          batchWeightDelta(db, allHorseIds, entries, targetDate),
+          batchJtComboFit(db, entries, targetDate),
+        ]);
+        const { results: racesFromDB } = await db.prepare(
+          `SELECT race_number, id, title, going, start_time FROM races WHERE meeting_id = ? ORDER BY race_number`
+        ).bind(meeting.id).all<any>().catch(() => ({ results: [] as any[] }));
+        const racesDBMap = new Map((racesFromDB ?? []).map((r: any) => [r.race_number, r]));
+        // 2026-09-13：狀態燈需要開跑時間才能計「開跑前 30 分鐘鎖定」。
+        // entries_upcoming.post_time 係唯一權威來源（賽後仍保留），欠缺時退回
+        // races.start_time，兩者皆無則 startTime = null（前端顯示「仍會更新」）。
+        const ptMapForStatus = await fetchPostTimeMap(db, targetDate, meeting.venue).catch(() => new Map<number, string>());
+        const raceMap = new Map<number, any[]>();
+        for (const e of entries) { const rn = e.race_number ?? 0; if (!raceMap.has(rn)) raceMap.set(rn, []); raceMap.get(rn)!.push(e); }
+        const raceNumbers = Array.from(raceMap.keys()).sort((a, b) => a - b);
+        // ── Stage 7 (2026-05-21): batch-load LGB pre-computed scores via shared helper ──
+        const { map: lgbScoreByRaceHorse, modelVersion: helperLgbModelVersion } =
+          await loadLgbScoresForMeeting(db, raceNumbers, racesDBMap, targetDate, meeting.venue);
+
+        const racePredictions = raceNumbers.map(raceNum => {
+          const raceEntries = raceMap.get(raceNum)!;
+          const firstE = raceEntries[0];
+          const raceDB = racesDBMap.get(raceNum);
+          const lgbLookupRaceId: string = raceDB?.id ?? `race_${targetDate}_${meeting.venue}_${raceNum}`;
+          const raceId: string = raceDB?.id ?? lgbLookupRaceId;
+          const raceTitle = raceDB?.title ?? (raceNum > 0 ? `第 ${raceNum} 場` : `${targetDate} 排位`);
+          const raceDistance: number | null = firstE.distance ?? null;
+          const raceGoing: string | null = raceDB?.going ?? meeting.track_condition ?? null;
+          const raceTrack: string | null = firstE.track ?? null;
+          const raceCourse: string | null = firstE.course ?? null;
+          const raceClass: string | null = firstE.race_class ?? null;
+          const enriched = raceEntries.map((e: any) => {
+            const horseId: string | null = e.horse_id ?? e.horse_code ?? null;
+            if (!horseId) return { horseId: null, horseNumber: e.horse_number, nameCh: e.name_ch ?? String(e.horse_number), nameEn: e.name_en, jockeyCh: e.jockey_name, trainerCh: e.trainer_name, draw: e.draw, declaredWeight: e.declared_weight, rating: e.rating, horseElo: null, jockeyElo: null, trainerElo: null, eloComposite: null, eloEngine: engine, horseConfidence: null, horseFrozen: false, horseRetired: false, factorBonus: 0, factorBreakdown: null, finalScore: null, daysSinceLast: null, _score: 0 };
+            const horseEloId = horseId;
+            const jSnapshotId: string | null = prefixId(e.jockey_id ?? e.jockey_name, 'jockey');
+            const tSnapshotId: string | null = prefixId(e.trainer_id ?? e.trainer_name, 'trainer');
+            const hRead = horseEloMap.get(horseEloId) ?? null;
+            const jRead = jSnapshotId ? (jockeyEloMap.get(jSnapshotId) ?? null) : null;
+            const tRead = tSnapshotId ? (trainerEloMap.get(tSnapshotId) ?? null) : null;
+            const hElo = hRead?.rating ?? null; const jElo = jRead?.rating ?? null; const tElo = tRead?.rating ?? null;
+            const parts: number[] = [];
+            if (hElo != null) parts.push(hElo * EW.horse);
+            if (jElo != null) parts.push(jElo * EW.jockey);
+            if (tElo != null) parts.push(tElo * EW.trainer);
+            const wSum = (hElo != null ? EW.horse : 0) + (jElo != null ? EW.jockey : 0) + (tElo != null ? EW.trainer : 0);
+            const eloComposite = wSum > 0 ? parts.reduce((a, b) => a + b, 0) / wSum : null;
+            const lastDate = recencyMap.get(horseId) ?? null;
+            const daysSince = lastDate ? Math.round((new Date(targetDate).getTime() - new Date(lastDate).getTime()) / 86400000) : null;
+            const recency = recencyBonus(daysSince);
+            const fDist = distMap.get(`${horseId}:${distBucket(raceDistance)}`) ?? { bonus: 0, conf: 0, note: '無距離往績' };
+            const fGoing = goingMap.get(`${horseId}:${raceGoing ?? ''}`) ?? { bonus: 0, conf: 0, note: '無場地往績' };
+            const _dKey = `${e.draw}:${meeting.venue}:${distBucket(raceDistance)}`;
+            const fDraw = resolveDrawFactor(DRAW_MODEL, drawMap, _dKey, { course: raceCourse, going: raceGoing, fieldSize: raceEntries.length, raceClass });
+            const fWeight = wtMap.get(horseId) ?? { bonus: 0, conf: 0, note: '無體重往績' };
+            const fCond = condMap.get(horseId) ?? { bonus: 0, conf: 0, note: '無晨操記錄' };
+            const fInjury = injMap.get(horseId) ?? { bonus: 0, conf: 0, note: '無傷病記錄' };
+            const fJT = jtMap.get(`${jSnapshotId ?? ''}:${tSnapshotId ?? ''}`) ?? { bonus: 0, conf: 0, note: '騎練配對資料不全' };
+            const factorBreakdown = { recency: { bonus: recency, conf: daysSince != null ? 1 : 0, note: daysSince != null ? `距上次 ${daysSince} 天` : '無上次紀錄' }, distance: fDist, going: fGoing, draw: fDraw, weight: fWeight, condition: fCond, injury: fInjury, jtCombo: fJT };
+            // R5 ablation (88d): production keeps only draw + weight (see reports/decision-log.md).
+            const factorBonus = fDraw.bonus * DRAW_SCALE + fWeight.bonus;
+            const base = eloComposite != null ? (eloComposite - 1500) / 200 : 0;
+            const finalScore = eloComposite != null ? eloComposite + factorBonus : null;
+            return { horseId, horseNumber: e.horse_number, nameCh: e.name_ch, nameEn: e.name_en, jockeyCh: e.jockey_name, trainerCh: e.trainer_name, draw: e.draw, declaredWeight: e.declared_weight, rating: e.rating, horseElo: hElo != null ? Math.round(hElo*10)/10 : null, jockeyElo: jElo != null ? Math.round(jElo*10)/10 : null, trainerElo: tElo != null ? Math.round(tElo*10)/10 : null, eloComposite: eloComposite != null ? Math.round(eloComposite*10)/10 : null, eloEngine: hRead?.engine ?? engine, horseConfidence: hRead?.confidence != null ? Math.round(hRead.confidence*100)/100 : null, horseFrozen: hRead?.isFrozen ?? false, horseRetired: hRead?.isRetired ?? false, factorBonus: Math.round(factorBonus*10)/10, factorBreakdown, finalScore: finalScore != null ? Math.round(finalScore*10)/10 : null, daysSinceLast: daysSince, _score: base + factorBonus / 100 };
+          });
+          // ── TX-Oracle v3 (2026-05-21): ensemble blend via shared helper ──
+          // P0 stacking: α·lgb_z + (1-α)·elo_z (default α=0.62, KV-tunable).
+          // P1 partial coverage: missing-LGB runners impute lgb_z = 0.
+          const { raceHasLgb, lgbHits, lgbModelVerForRace } = applyEnsembleBlend(
+            enriched as any[], effectiveAlpha, lgbScoreByRaceHorse, lgbLookupRaceId,
+          );
+          const _prob = computeRaceProbabilities((enriched as any[]).map((s) => s._score));
+          const picks = enriched.map((s, i) => { const { _score, ...rest } = s as any; return { ...rest, pWin: Math.round(_prob.pWin[i]*1000)/1000, pTop3: Math.round(_prob.pTop3[i]*1000)/1000, pTop4: Math.round(_prob.pTop4[i]*1000)/1000 }; });
+          picks.sort((a: any, b: any) => b.pWin - a.pWin);
+          picks.forEach((p: any, i: number) => { p.rank = i + 1; });
+          const _txTotal = (enriched as any[]).length;
+          return { raceId, lgbLookupRaceId, raceNumber: raceNum, startTime: hhmmFromPostTime(ptMapForStatus.get(raceNum)) ?? raceDB?.start_time ?? null, title: raceTitle, class: raceClass, distance: raceDistance, going: raceGoing, track: raceTrack, course: raceCourse, picks, scoreSource: raceHasLgb ? `tx-oracle-v3 (lgb=${lgbHits}/${_txTotal}, α=${effectiveAlpha.toFixed(2)})` : 'elo+factor', lgbCoverage: { hits: lgbHits, total: _txTotal, applied: raceHasLgb }, lgbModelVersion: lgbModelVerForRace, ensembleAlpha: effectiveAlpha, expectedBoxCoverage: roundCoverage(_prob.coverage), probabilityModel: _prob.model };
+        });
+        attachRaceQuality(racePredictions);
+        const _calib = await getProbCalibration(db);
+        applyProbCalibration(racePredictions, _calib);
+        const eloReady = racePredictions.some((r) => r.picks?.some((p: any) => p.eloComposite != null));
+        return { date: targetDate, venue: meeting.venue, trackCondition: meeting.track_condition, eloEngine: engine, eloWeights: EW, eloReady, races: racePredictions, lgbModelVersion: helperLgbModelVersion, lgbCoverage: { rows: lgbScoreByRaceHorse.size }, probCalibration: _calib ? { version: _calib.version, top3: _calib.top3, fittedAt: _calib.fittedAt } : null, generatedAt: new Date().toISOString() };
+      }
+
+      // GET /api/analyze/today-picks — 即日排位全因子預測 (batch-query version; ~20 D1 queries)
+    // === Race-day report compute (Stage 8) ============================
+      // Extracted so cron + admin manual trigger can re-use the same logic.
+      // Cache-first by default; pass { fresh: true } to force recompute + cache write.
+
+      // GET /api/analyze/today-picks — 即日排位全因子預測 (batch-query version; ~20 D1 queries)
+    // === Race-day report compute (Stage 8) ============================
+      // Extracted so cron + admin manual trigger can re-use the same logic.
+      // Cache-first by default; pass { fresh: true } to force recompute + cache write.
+
+      export async function runRaceDayReportCompute(db: D1Database, engine: EloEngine, opts: { fresh?: boolean; venue?: string } = {}): Promise<any> {
+        const fresh = opts.fresh === true;
+        const forceVenue = opts.venue;
+        const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Hong_Kong' }).format(new Date());
+        if (isCancelledMeeting(todayStr)) {
+          return {
+            date: todayStr, venue: null, trackCondition: null, races: [],
+            cancelled: true, cancellationReason: '因董建華離世，今日賽事停賽',
+            frozen: false, edition: 'draft', generatedAt: new Date().toISOString(),
+          };
+        }
+        // Date picker: use race_meetings (persisted by Capy D1 Sync immediately) as
+        // the authoritative source, NOT entries_upcoming (lags Capy Racecard
+        // enrichment by minutes-to-hours). Previously picked MAX(entries_upcoming)
+        // = latest PAST race day when next meeting's entries weren't enriched yet,
+        // causing "排位表無資料" for already-raced dates. Now picks next upcoming
+        // meeting and lets the entries-empty fallback below give a clearer message.
+        let targetDate: string | null = await db.prepare(
+          `SELECT MIN(date) FROM race_meetings WHERE date >= ? AND venue IN ('ST','HV')`
+        ).bind(todayStr).first<string>('MIN(date)').catch(() => null);
+        if (!targetDate) {
+          targetDate = await db.prepare(`SELECT MAX(date) FROM race_meetings WHERE venue IN ('ST','HV')`).first<string>('MAX(date)').catch(() => null);
+        }
+        if (!targetDate) return { error: '賽馬日記錄不存在', status: 404 };
+
+        // NOTE: early non-venue cache read removed (architect 2026-05-25). Writes use
+        // venue-scoped key (cacheKey = `${engine}::${venue}`) at the bottom of this fn,
+        // so bare-`engine` reads were dead code at best, and could return stale
+        // wrong-venue payloads at worst if pre-venue-scoping cache rows survived.
+        // Venue-scoped cache read happens after meeting resolution below.
+        const t0 = Date.now();
+
+        // Pick meeting: prefer one with entries_upcoming rows for that date
+          // (today-picks is about racecards we'll predict, not historic results).
+          // Falls back to most-races meeting. ?venue=HV forces a specific venue.
+          let meeting: any = null;
+          if (forceVenue) {
+            meeting = await db.prepare(`SELECT m.* FROM race_meetings m WHERE m.date = ? AND m.venue = ? AND m.venue IN ('ST','HV') LIMIT 1`).bind(targetDate, forceVenue).first<any>().catch(() => null);
+          }
+          if (!meeting) {
+            meeting = await db.prepare(
+              `SELECT m.* FROM race_meetings m
+                WHERE m.date = ?
+                  AND m.venue IN ('ST','HV')
+                  AND EXISTS (SELECT 1 FROM entries_upcoming e WHERE e.race_date = m.date AND e.venue = m.venue AND e.race_number > 0)
+                ORDER BY m.id LIMIT 1`
+            ).bind(targetDate).first<any>().catch(() => null);
+          }
+          if (!meeting) {
+            meeting = await db.prepare(`SELECT m.* FROM race_meetings m WHERE m.date = ? AND m.venue IN ('ST','HV') ORDER BY (SELECT COUNT(*) FROM races r WHERE r.meeting_id = m.id) DESC, m.id LIMIT 1`).bind(targetDate).first<any>().catch(() => null);
+          }
+          if (!meeting) return { error: `${targetDate} 賽馬日記錄不存在`, status: 404 };
+
+          // Architect fix: venue-scoped cache key so HV/ST don't collide; ?venue= bypasses.
+          const cacheKey = `${engine}::${meeting.venue}`;
+          if (!fresh && !forceVenue) {
+            const cached = await readRaceDayReportCache(db, targetDate, cacheKey);
+            if (cached) return cached;
+          }
+          const loadEntries = async (withVenue: boolean) => {
+          const q = withVenue
+            ? `SELECT e.race_number, e.horse_number, e.horse_id, e.horse_code,
+                     e.draw, e.declared_weight, e.actual_weight, e.jockey_name, e.jockey_id,
+                     e.trainer_name, e.trainer_id, e.rating, e.priority_order,
+                     e.distance, e.track, e.course, e.race_class,
+                     h.name_ch, h.name_en
+               FROM entries_upcoming e LEFT JOIN horses h ON h.id = e.horse_id
+               WHERE e.race_date = ? AND e.venue = ? AND e.race_number > 0
+               ORDER BY e.race_number, e.horse_number`
+            : `SELECT e.race_number, e.horse_number, e.horse_id, e.horse_code,
+                     e.draw, e.declared_weight, e.actual_weight, e.jockey_name, e.jockey_id,
+                     e.trainer_name, e.trainer_id, e.rating, e.priority_order,
+                     e.distance, e.track, e.course, e.race_class,
+                     h.name_ch, h.name_en
+               FROM entries_upcoming e LEFT JOIN horses h ON h.id = e.horse_id
+               WHERE e.race_date = ? AND e.venue IN ('ST','HV') AND e.race_number > 0
+               ORDER BY e.race_number, e.horse_number`;
+          const stmt = withVenue ? db.prepare(q).bind(targetDate, meeting.venue) : db.prepare(q).bind(targetDate);
+          const { results } = await stmt.all<any>().catch(() => ({ results: [] as any[] }));
+          return results ?? [];
+        };
+        let entries = await loadEntries(true);
+        if (!entries.length) entries = await loadEntries(false);
+        if (!entries.length) return { error: `${targetDate} ${meeting.venue} 排位表更新中，請稍候`, status: 404, targetDate, venue: meeting.venue };
+        const prefixId = (raw: string | null | undefined, kind: 'horse' | 'jockey' | 'trainer'): string | null => {
+          if (!raw) return null;
+          const p = kind + '_';
+          return raw.startsWith(p) ? raw : p + raw;
+        };
+        const allHorseIds = [...new Set(entries.map(e => prefixId(e.horse_id ?? e.horse_code, 'horse')).filter(Boolean) as string[])];
+        const horseEloIds = allHorseIds;
+        const allJockeyIds = [...new Set(entries.map(e => prefixId(e.jockey_id ?? e.jockey_name, 'jockey')).filter(Boolean) as string[])];
+        const allTrainerIds = [...new Set(entries.map(e => prefixId(e.trainer_id ?? e.trainer_name, 'trainer')).filter(Boolean) as string[])];
+        const TP_DRAW_MODEL: DrawModel = await getDrawModel(db);
+        const [horseEloMap, jockeyEloMap, trainerEloMap, recencyMap, distMap, goingMap, drawMap, condMap, injMap, wtMap, jtMap] = await Promise.all([
+          batchEloReadings(db, 'horse', horseEloIds, targetDate, engine),
+          batchEloReadings(db, 'jockey', allJockeyIds, targetDate, engine),
+          batchEloReadings(db, 'trainer', allTrainerIds, targetDate, engine),
+          batchLastRaceDate(db, allHorseIds, targetDate),
+          batchDistanceFit(db, allHorseIds, targetDate),
+          batchGoingFit(db, allHorseIds, targetDate),
+          (TP_DRAW_MODEL === 'v3' ? batchDrawBiasV3 : TP_DRAW_MODEL === 'v2' ? batchDrawBiasV2 : batchDrawBias)(db, entries, meeting.venue, targetDate),
+          batchConditionFit(db, allHorseIds, targetDate),
+          batchInjuryFlag(db, allHorseIds, targetDate),
+          batchWeightDelta(db, allHorseIds, entries, targetDate),
+          batchJtComboFit(db, entries, targetDate),
+        ]);
+        const { results: racesFromDB } = await db.prepare(
+          `SELECT race_number, id, title, going, start_time FROM races WHERE meeting_id = ? ORDER BY race_number`
+        ).bind(meeting.id).all<any>().catch(() => ({ results: [] as any[] }));
+        const racesDBMap = new Map((racesFromDB ?? []).map((r: any) => [r.race_number, r]));
+        // 2026-09-13：狀態燈需要開跑時間才能計「開跑前 30 分鐘鎖定」。
+        // entries_upcoming.post_time 係唯一權威來源（賽後仍保留），欠缺時退回
+        // races.start_time，兩者皆無則 startTime = null（前端顯示「仍會更新」）。
+        const ptMapForStatus = await fetchPostTimeMap(db, targetDate, meeting.venue).catch(() => new Map<number, string>());
+        const raceMap = new Map<number, any[]>();
+        for (const e of entries) { const rn = e.race_number ?? 0; if (!raceMap.has(rn)) raceMap.set(rn, []); raceMap.get(rn)!.push(e); }
+        const raceNumbers = Array.from(raceMap.keys()).sort((a, b) => a - b);
+        let seedRatingCount = 0, seedClassCount = 0;
+
+        // ── Stage 7 (2026-05-21): batch-load LGB pre-computed scores via shared helper ──
+        // Synth race_id matches scripts/import-csv.ts raceId():
+        //   race_<YYYY-MM-DD>_<VENUE>_<raceNo>
+        // For upcoming races (no races row yet) the dump-features synth uses
+        // the same key, so lookup works before & after results are imported.
+        const { map: lgbScoreByRaceHorse, modelVersion: todayPicksLgbModelVersion } =
+          await loadLgbScoresForMeeting(db, raceNumbers, racesDBMap, targetDate, meeting.venue);
+        const todayPicksAlpha = await getEnsembleAlpha(db);
+        const EW: EloWeights = await getEloWeights(db);
+        const liveWinOddsByRace = await fetchLatestWinOddsByRace(db, targetDate, meeting.venue).catch(() => new Map<number, { odds: Map<string, number>; snapshotAt: string }>());
+
+        const racePredictions = raceNumbers.map(raceNum => {
+          const raceEntries = raceMap.get(raceNum)!;
+          const firstE = raceEntries[0];
+          const raceDB = racesDBMap.get(raceNum);
+          const raceId = raceDB?.id ?? null;
+          const lgbLookupRaceId: string = raceDB?.id ?? `race_${targetDate}_${meeting.venue}_${raceNum}`;
+          const raceTitle = raceDB?.title ?? (raceNum > 0 ? `第 ${raceNum} 場` : `${targetDate} 排位`);
+          const raceDistance: number | null = firstE.distance ?? null;
+          const raceGoing: string | null = raceDB?.going ?? meeting.track_condition ?? null;
+          const raceTrack: string | null = firstE.track ?? null;
+          const raceCourse: string | null = firstE.course ?? null;
+          const raceClass: string | null = firstE.race_class ?? null;
+          const enriched = raceEntries.map((e: any) => {
+            const horseId: string | null = e.horse_id ?? e.horse_code ?? null;
+            if (!horseId) return { horseId: null, horseNumber: e.horse_number, nameCh: e.name_ch ?? String(e.horse_number), nameEn: e.name_en, jockeyCh: e.jockey_name, trainerCh: e.trainer_name, draw: e.draw, declaredWeight: e.declared_weight, rating: e.rating, horseElo: null, jockeyElo: null, trainerElo: null, eloComposite: null, eloEngine: engine, eloSource: 'none', horseConfidence: null, horseFrozen: false, horseRetired: false, factorBonus: 0, factorBreakdown: null, finalScore: null, daysSinceLast: null, _score: 0 };
+            const horseEloId = horseId;
+            const jSnapshotId: string | null = prefixId(e.jockey_id ?? e.jockey_name, 'jockey');
+            const tSnapshotId: string | null = prefixId(e.trainer_id ?? e.trainer_name, 'trainer');
+            const hRead = horseEloMap.get(horseEloId) ?? null;
+            const jRead = jSnapshotId ? (jockeyEloMap.get(jSnapshotId) ?? null) : null;
+            const tRead = tSnapshotId ? (trainerEloMap.get(tSnapshotId) ?? null) : null;
+            let hElo: number | null = hRead?.rating ?? null;
+            let eloSource: 'snapshot' | 'rating-seed' | 'class-seed' | 'none' = hRead ? 'snapshot' : 'none';
+            let seedConfidence: number | null = null;
+            if (hElo == null) {
+              const seed = seedHorseElo(e.rating, raceClass);
+              hElo = seed.rating;
+              eloSource = seed.source;
+              seedConfidence = seed.confidence;
+              if (seed.source === 'rating-seed') seedRatingCount++; else seedClassCount++;
+            }
+            const jElo = jRead?.rating ?? null; const tElo = tRead?.rating ?? null;
+            // Phase A: down-weight horse ELO when low-confidence (seed) so jockey+trainer carry more.
+            // snapshot w/o explicit conf → 1.0; rating-seed → 0.4; class-seed → 0.2.
+            const horseConfFactor = eloSource === 'snapshot' ? (hRead?.confidence ?? 1) : (seedConfidence ?? 0);
+            const effHorseW = EW.horse * horseConfFactor;
+            const parts: number[] = [];
+            if (hElo != null) parts.push(hElo * effHorseW);
+            if (jElo != null) parts.push(jElo * EW.jockey);
+            if (tElo != null) parts.push(tElo * EW.trainer);
+            const wSum = (hElo != null ? effHorseW : 0) + (jElo != null ? EW.jockey : 0) + (tElo != null ? EW.trainer : 0);
+            const eloComposite = wSum > 0 ? parts.reduce((a, b) => a + b, 0) / wSum : null;
+            const lastDate = recencyMap.get(horseId) ?? null;
+            const daysSince = lastDate ? Math.round((new Date(targetDate!).getTime() - new Date(lastDate).getTime()) / 86400000) : null;
+            const recency = recencyBonus(daysSince);
+            const fDist = distMap.get(`${horseId}:${distBucket(raceDistance)}`) ?? { bonus: 0, conf: 0, note: '無距離往績' };
+            const fGoing = goingMap.get(`${horseId}:${raceGoing ?? ''}`) ?? { bonus: 0, conf: 0, note: '無場地往績' };
+            const _dKey = `${e.draw}:${meeting.venue}:${distBucket(raceDistance)}`;
+            const fDraw = resolveDrawFactor(TP_DRAW_MODEL, drawMap, _dKey, { course: raceCourse, going: raceGoing, fieldSize: raceEntries.length, raceClass });
+            const fWeight = wtMap.get(horseId) ?? { bonus: 0, conf: 0, note: '無體重往績' };
+            const fCond = condMap.get(horseId) ?? { bonus: 0, conf: 0, note: '無晨操記錄' };
+            const fInjury = injMap.get(horseId) ?? { bonus: 0, conf: 0, note: '無傷病記錄' };
+            const fJT = jtMap.get(`${jSnapshotId ?? ''}:${tSnapshotId ?? ''}`) ?? { bonus: 0, conf: 0, note: '騎練配對資料不全' };
+            const factorBreakdown = { recency: { bonus: recency, conf: daysSince != null ? 1 : 0, note: daysSince != null ? `距上次 ${daysSince} 天` : (eloSource !== 'snapshot' ? '新馬未曾出賽' : '無上次紀錄') }, distance: fDist, going: fGoing, draw: fDraw, weight: fWeight, condition: fCond, injury: fInjury, jtCombo: fJT };
+            // R5 ablation (88d): production keeps only draw + weight (see reports/decision-log.md).
+            const factorBonus = fDraw.bonus + fWeight.bonus;
+            const base = eloComposite != null ? (eloComposite - 1500) / 200 : 0;
+            const finalScore = eloComposite != null ? eloComposite + factorBonus : null;
+            const computedConf = hRead?.confidence != null ? Math.round(hRead.confidence*100)/100 : (seedConfidence != null ? seedConfidence : null);
+            return { horseId, horseNumber: e.horse_number, nameCh: e.name_ch, nameEn: e.name_en, jockeyCh: e.jockey_name, trainerCh: e.trainer_name, draw: e.draw, declaredWeight: e.declared_weight, rating: e.rating, horseElo: hElo != null ? Math.round(hElo*10)/10 : null, jockeyElo: jElo != null ? Math.round(jElo*10)/10 : null, trainerElo: tElo != null ? Math.round(tElo*10)/10 : null, eloComposite: eloComposite != null ? Math.round(eloComposite*10)/10 : null, eloEngine: hRead?.engine ?? engine, eloSource, horseConfidence: computedConf, horseConfWeightFactor: Math.round(horseConfFactor*100)/100, horseFrozen: hRead?.isFrozen ?? false, horseRetired: hRead?.isRetired ?? false, factorBonus: Math.round(factorBonus*10)/10, factorBreakdown, finalScore: finalScore != null ? Math.round(finalScore*10)/10 : null, daysSinceLast: daysSince, _score: base + factorBonus / 100 };
+          });
+          // ── TX-Oracle v3 (2026-05-21): ensemble blend via shared helper ──
+            const { raceHasLgb, lgbHits, lgbModelVerForRace } = applyEnsembleBlend(
+              enriched as any[], todayPicksAlpha, lgbScoreByRaceHorse, lgbLookupRaceId,
+            );
+            const _prob = computeRaceProbabilities((enriched as any[]).map((s) => s._score));
+          const picks = enriched.map((s, i) => { const { _score, ...rest } = s as any; return { ...rest, pWin: Math.round(_prob.pWin[i]*1000)/1000, pTop3: Math.round(_prob.pTop3[i]*1000)/1000, pTop4: Math.round(_prob.pTop4[i]*1000)/1000 }; });
+          picks.sort((a: any, b: any) => b.pWin - a.pWin);
+          picks.forEach((p: any, i: number) => { p.rank = i + 1; });
+          const _mbOdds = liveWinOddsByRace.get(raceNum) ?? null;
+          const _mb = attachMarketBlend(picks, _mbOdds?.odds ?? null);
+          const _txTotal2 = (enriched as any[]).length;
+          return { raceId, lgbLookupRaceId, raceNumber: raceNum, startTime: hhmmFromPostTime(ptMapForStatus.get(raceNum)) ?? raceDB?.start_time ?? null, title: raceTitle, class: raceClass, distance: raceDistance, going: raceGoing, track: raceTrack, course: raceCourse, picks, scoreSource: raceHasLgb ? `tx-oracle-v3 (lgb=${lgbHits}/${_txTotal2}, α=${todayPicksAlpha.toFixed(2)})` : 'elo+factor', lgbCoverage: { hits: lgbHits, total: _txTotal2, applied: raceHasLgb }, lgbModelVersion: lgbModelVerForRace, ensembleAlpha: todayPicksAlpha, marketReady: _mb.marketReady, oddsSnapshotAt: _mbOdds?.snapshotAt ?? null, marketBeta: MARKET_BLEND_BETA, expectedBoxCoverage: roundCoverage(_prob.coverage), probabilityModel: _prob.model };
+        });
+        attachRaceQuality(racePredictions);
+        const _calibToday = await getProbCalibration(db);
+        applyProbCalibration(racePredictions, _calibToday);
+        const eloReady = racePredictions.some((r) => r.picks?.some((p: any) => p.eloComposite != null));
+        const computeMs = Date.now() - t0;
+        const payload: Record<string, unknown> = {
+          date: targetDate, venue: meeting.venue, trackCondition: meeting.track_condition,
+          eloEngine: engine, eloWeights: EW, eloReady, races: racePredictions,
+          seedSummary: { ratingSeeded: seedRatingCount, classSeeded: seedClassCount, totalSeeded: seedRatingCount + seedClassCount },
+          lgbModelVersion: todayPicksLgbModelVersion,
+          lgbCoverage: { rows: lgbScoreByRaceHorse.size },
+          probCalibration: _calibToday ? { version: _calibToday.version, top3: _calibToday.top3, fittedAt: _calibToday.fittedAt } : null,
+          computeMs, generatedAt: new Date().toISOString(),
+        };
+        // Phase A: write each prediction to prediction_log for back-test (idempotent).
+        const logResult = await writePredictionLog(db, payload, 'baseline').catch((e) => ({ rows: 0, error: String(e?.message ?? e) }));
+        payload.predictionLog = logResult;
+
+        await writeRaceDayReportCache(db, targetDate, cacheKey, meeting.venue, payload, computeMs).catch(() => {});
+        return payload;
+      }
+
+      analyzeRoutes.get('/today-picks', async (c) => {
+        try {
+          const admin = await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER);
+          const engine: EloEngine = admin && c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const fresh = admin && c.req.query('fresh') === '1';
+          const venue = admin ? (c.req.query('venue') || undefined) : undefined;
+          const result = await runRaceDayReportCompute(c.env.DB, engine, { fresh, venue });
+          if (result?.error) {
+            const status = Number(result.status);
+            const publicStatus = status >= 400 && status < 600 ? status : 500;
+            return c.json(
+              admin ? { error: result.error } : { error: 'today-picks unavailable' },
+              publicStatus as any,
+            );
+          }
+          if (admin) return c.json(result);
+          const settled = await raceDayReportIsSettled(c.env.DB, result);
+          const projected = settled
+            ? projectTodayPicksForPublic(result)
+            : projectTodayPicksForFree(result);
+          // 版本標示 SSOT：未鎖一律 draft（初版），只有讀到凍結快照先 final（最終版）。
+          const frozen = await freezeMeetingPayload(c.env.DB, result).then((p: any) => p?.frozen === true).catch(() => false);
+          projected.frozen = frozen;
+          projected.edition = frozen ? 'final' : 'draft';
+          return c.json(projected);
+
+        } catch {
+          return c.json({ error: 'today-picks unavailable' }, 500);
+        }
+      });
+
+      // POST /admin/api/refresh-race-day-report — manual rebuild trigger (admin only via token gate upstream)
+      analyzeRoutes.post('/refresh-race-day-report', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const engine: EloEngine = c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const result = await runRaceDayReportCompute(c.env.DB, engine, { fresh: true });
+          if (result?.error) return c.json({ error: result.error }, (result.status ?? 500) as any);
+          return c.json({ ok: true, date: result.date, venue: result.venue, races: result.races?.length ?? 0, computeMs: result.computeMs, seedSummary: result.seedSummary, predictionLog: result.predictionLog, generatedAt: result.generatedAt });
+        } catch {
+          return c.json({ error: 'refresh failed' }, 500);
+        }
+      });
+
+
+
+          // GET /api/analyze/roi?days=60 — actual ROI backtest using captured win odds
+          // Strategies (all bet a flat $1 stake on rank-1 of each variant unless noted):
+          //   A. ALWAYS:        always bet rank-1
+          //   B. SP_3_8:        only bet when actual SP odds in [3, 8] (skip heavy faves + longshots)
+          //   C. EV_GT_5:       only bet when (pWin × SP_odds) > 1.05  (positive expected value by model)
+          // Returns per-variant × per-strategy: bets, hits, hitRate, avgPayout, totalPnL, roiPct
+          analyzeRoutes.get('/roi', async (c) => {
+            try {
+              if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+              const days = Math.max(1, Math.min(365, Number(c.req.query('days') ?? '60')));
+              const sinceDate = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+              const { results } = await c.env.DB.prepare(
+                `SELECT variant, date, race_number, p_win, predicted_rank,
+                        actual_finish, actual_win_odds, is_hit_top1
+                   FROM prediction_log
+                   WHERE date >= ? AND actual_finish IS NOT NULL
+                     AND predicted_rank = 1`
+              ).bind(sinceDate).all<any>().catch(() => ({ results: [] as any[] }));
+
+              const strategies = ['ALWAYS', 'SP_3_8', 'EV_GT_5'] as const;
+              const acc: Record<string, Record<string, { bets: number; hits: number; payoutSum: number }>> = {};
+
+              for (const r of (results ?? [])) {
+                const v = r.variant ?? 'baseline';
+                const odds = r.actual_win_odds == null ? null : Number(r.actual_win_odds);
+                const pWin = r.p_win == null ? null : Number(r.p_win);
+                const isHit = r.is_hit_top1 ? 1 : 0;
+                if (odds == null || odds <= 1) continue;
+
+                const inRange = odds >= 3 && odds <= 8;
+                const evPositive = pWin != null && (pWin * odds) > 1.05;
+
+                const filters: Record<string, boolean> = {
+                  ALWAYS: true,
+                  SP_3_8: inRange,
+                  EV_GT_5: evPositive,
+                };
+                if (!acc[v]) acc[v] = {};
+                for (const s of strategies) {
+                  if (!filters[s]) continue;
+                  if (!acc[v][s]) acc[v][s] = { bets: 0, hits: 0, payoutSum: 0 };
+                  acc[v][s].bets++;
+                  if (isHit) {
+                    acc[v][s].hits++;
+                    acc[v][s].payoutSum += odds; // flat $1 stake → return = odds (incl. stake)
+                  }
+                }
+              }
+
+              const summary: any[] = [];
+              for (const [variant, byStrat] of Object.entries(acc)) {
+                for (const s of strategies) {
+                  const row = byStrat[s];
+                  if (!row || row.bets === 0) {
+                    summary.push({ variant, strategy: s, bets: 0, hits: 0, hitRatePct: null, avgWinPayout: null, totalPnL: null, roiPct: null });
+                    continue;
+                  }
+                  const hitRate = row.hits / row.bets;
+                  const totalReturn = row.payoutSum;            // sum of odds when won (stake $1 each)
+                  const totalStake = row.bets;                  // 1 per bet
+                  const pnl = totalReturn - totalStake;
+                  const roiPct = (pnl / totalStake) * 100;
+                  const avgWinPayout = row.hits ? row.payoutSum / row.hits : null;
+                  summary.push({
+                    variant,
+                    strategy: s,
+                    bets: row.bets,
+                    hits: row.hits,
+                    hitRatePct: Math.round(hitRate * 1000) / 10,
+                    avgWinPayout: avgWinPayout != null ? Math.round(avgWinPayout * 100) / 100 : null,
+                    totalPnL: Math.round(pnl * 100) / 100,
+                    roiPct: Math.round(roiPct * 100) / 100,
+                  });
+                }
+              }
+              summary.sort((x, y) => x.variant.localeCompare(y.variant) || strategies.indexOf(x.strategy as any) - strategies.indexOf(y.strategy as any));
+
+              return c.json({
+                sinceDate,
+                days,
+                note: 'Flat $1 stake on rank-1 pick. ROI%=(totalReturn-totalStake)/totalStake. avgWinPayout includes stake (HK SP convention).',
+                strategies: {
+                  ALWAYS: 'Bet on every rank-1 pick',
+                  SP_3_8: 'Only bet when SP odds in [3, 8]',
+                  EV_GT_5: 'Only bet when (pWin × SP_odds) > 1.05',
+                },
+                summary,
+              });
+            } catch {
+              return c.json({ error: 'roi failed' }, 500);
+            }
+          });
+
+        // GET /api/analyze/value-picks?date=YYYY-MM-DD&min=3&max=8
+        // For each race, returns the R5 rank-1 pick if its latest WIN odds fall in [min, max].
+        // Default [3, 8] follows SP_3_8 strategy proven +19% ROI on baseline 60d backtest.
+        analyzeRoutes.get('/value-picks', async (c) => {
+          try {
+            if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+            const dateParam = c.req.query('date') ?? null;
+            const minOdds = Math.max(1.01, Number(c.req.query('min') ?? '3'));
+            const maxOdds = Math.max(minOdds, Number(c.req.query('max') ?? '8'));
+            const engine: EloEngine = c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+            const report = await runRaceDayReportCompute(c.env.DB, engine, { fresh: false });
+            if (report?.error) return c.json({ error: report.error }, (report.status ?? 500) as any);
+            const date = dateParam ?? report.date;
+            const venue = report.venue;
+            if (!date || !venue) return c.json({ error: 'no race day available' }, 404);
+            const { results: oddsRows } = await c.env.DB.prepare(
+              `SELECT race_number, horse_no, odds, snapshot_at FROM (
+                 SELECT race_number, combination AS horse_no, odds, snapshot_at,
+                        ROW_NUMBER() OVER (PARTITION BY race_number, combination ORDER BY snapshot_at DESC) AS rn
+                   FROM odds_snapshots
+                   WHERE race_date = ? AND venue = ? AND pool_type = 'WIN'
+               ) WHERE rn = 1`
+            ).bind(date, venue).all<any>().catch(() => ({ results: [] as any[] }));
+            const oddsMap = new Map<string, { odds: number | null; snapshotAt: string | null }>();
+            for (const r of (oddsRows ?? [])) {
+              oddsMap.set(`${r.race_number}:${normHorseKey(r.horse_no)}`, {
+                odds: r.odds == null ? null : Number(r.odds),
+                snapshotAt: r.snapshot_at ?? null,
+              });
+            }
+            const picks: any[] = [];
+            let oddsAvailable = 0;
+            let oddsTotal = 0;
+            for (const race of (report.races ?? [])) {
+              const top = (race.picks ?? []).find((p: any) => p.rank === 1);
+              if (!top) continue;
+              const o = oddsMap.get(`${race.raceNumber}:${normHorseKey(top.horseNumber)}`);
+              oddsTotal++;
+              if (o?.odds != null) oddsAvailable++;
+              const inRange = o?.odds != null && o.odds >= minOdds && o.odds <= maxOdds;
+              if (inRange) {
+                picks.push({
+                  raceNumber: race.raceNumber, raceTitle: race.title,
+                  distance: race.distance, going: race.going,
+                  horseNumber: top.horseNumber, nameCh: top.nameCh, nameEn: top.nameEn,
+                  jockey: top.jockeyCh, trainer: top.trainerCh, draw: top.draw,
+                  pWin: top.pWin, pTop3: top.pTop3,
+                  eloComposite: top.eloComposite, finalScore: top.finalScore,
+                  liveOdds: o!.odds, oddsSnapshotAt: o!.snapshotAt,
+                  impliedP: o!.odds ? Math.round((1 / o!.odds) * 1000) / 1000 : null,
+                  modelEdgePp: (top.pWin != null && o!.odds) ? Math.round((top.pWin - 1 / o!.odds) * 1000) / 10 : null,
+                });
+              }
+            }
+            return c.json({
+              date, venue, oddsRange: { min: minOdds, max: maxOdds },
+              note: 'Filter follows SP_3_8 strategy (+19% ROI on baseline 60d). Live odds = latest WIN snapshot. Production SP may differ.',
+              races: report.races?.length ?? 0, oddsAvailable, oddsTotal,
+              valuePicks: picks, generatedAt: new Date().toISOString(),
+            });
+          } catch {
+            return c.json({ error: 'value-picks failed' }, 500);
+          }
+        });
+
+
+
+
+
+
+      // GET /api/analyze/backtest-dates?days=90 — list dates with race_results in window
+      analyzeRoutes.get('/backtest-dates', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const days = Math.max(1, Math.min(365, Number(c.req.query('days') ?? '90')));
+          const since = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+          // No upper-date bound: EXISTS(race_results.finishing_position>0) already limits to
+          // settled (past) meetings, so today's results appear as soon as they are in D1.
+          // (Previously the strict upper bound used a UTC-derived 'today', which hid the
+          // current race day until the UTC date rolled over ~08:00 HKT the next morning.)
+          const { results } = await c.env.DB.prepare(
+            `SELECT DISTINCT m.date FROM race_meetings m
+               WHERE m.date >= ?
+                 AND m.venue IN ('ST','HV')
+                 AND EXISTS (SELECT 1 FROM races r JOIN race_results rr ON rr.race_id = r.id WHERE r.meeting_id = m.id AND rr.finishing_position > 0)
+               ORDER BY m.date ASC`
+          ).bind(since).all<{ date: string }>();
+          return c.json({ ok: true, days, dates: (results ?? []).map(r => r.date) });
+        } catch {
+          return c.json({ error: 'list failed' }, 500);
+        }
+      });
+
+
+      // POST /api/analyze/join-prediction-results?date=YYYY-MM-DD — backfill actuals into prediction_log
+      analyzeRoutes.post('/join-prediction-results', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const date = c.req.query('date');
+          if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400);
+          const r = await joinPredictionResults(c.env.DB, date);
+          return c.json({ ok: true, date, ...r });
+        } catch {
+          return c.json({ error: 'join failed' }, 500);
+        }
+      });
+    
+
+      // GET /api/analyze/picks-by-date?date=YYYY-MM-DD — 指定賽事日全因子預測（支援未來/過去日期）
+      analyzeRoutes.get('/picks-by-date', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const db = c.env.DB;
+          const date = c.req.query('date');
+          if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: '請提供 YYYY-MM-DD 格式日期' }, 400);
+          const engine: EloEngine = c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const meeting = await db.prepare(`SELECT m.* FROM race_meetings m WHERE m.date = ? AND m.venue IN ('ST','HV') ORDER BY (SELECT COUNT(*) FROM races r WHERE r.meeting_id = m.id) DESC, m.id LIMIT 1`).bind(date).first<any>().catch(() => null);
+          if (!meeting) return c.json({ error: `${date} 賽馬日記錄不存在` }, 404);
+          // Try entries_upcoming first (works for upcoming dates)
+          const { results: euRows } = await db.prepare(
+            `SELECT e.race_number, e.horse_number, e.horse_id, e.horse_code,
+                    e.draw, e.declared_weight, e.actual_weight, e.jockey_name, e.jockey_id,
+                    e.trainer_name, e.trainer_id, e.rating, e.priority_order,
+                    e.distance, e.track, e.course, e.race_class,
+                    h.name_ch, h.name_en
+             FROM entries_upcoming e LEFT JOIN horses h ON h.id = e.horse_id
+             WHERE e.race_date = ? AND e.venue IN ('ST','HV') AND e.race_number > 0
+             ORDER BY e.race_number, e.horse_number`
+          ).bind(date).all<any>().catch(() => ({ results: [] as any[] }));
+          let entries = euRows ?? [];
+          let source: 'upcoming' | 'historical' = 'upcoming';
+          // Fallback to race_results for past meetings
+          if (!entries.length) {
+            const { results: rrRows } = await db.prepare(
+              `SELECT r.race_number, rr.horse_number, rr.horse_id, rr.draw, rr.actual_weight,
+                      rr.actual_weight AS declared_weight, rr.jockey_id, rr.trainer_id,
+                      r.distance, r.going, r.class AS race_class,
+                      NULL AS track, NULL AS course,
+                      h.name_ch, h.name_en,
+                      j.name_ch AS jockey_name, t.name_ch AS trainer_name
+               FROM race_results rr
+               JOIN races r ON r.id = rr.race_id
+               JOIN race_meetings rm ON rm.id = r.meeting_id
+               LEFT JOIN horses h ON h.id = rr.horse_id
+               LEFT JOIN jockeys j ON j.id = rr.jockey_id
+               LEFT JOIN trainers t ON t.id = rr.trainer_id
+               WHERE rm.date = ? AND rm.venue IN ('ST','HV')
+               ORDER BY r.race_number, rr.horse_number`
+            ).bind(date).all<any>().catch(() => ({ results: [] as any[] }));
+            entries = rrRows ?? [];
+            source = 'historical';
+          }
+          if (!entries.length) return c.json({ error: `${date} 排位/賽果無資料` }, 404);
+          const result = await computePicksFromEntries(db, date, meeting, entries, engine);
+          // ── PREDICTION VS RESULT accountability (freeze) ──────────────────
+          // A live recompute of a SETTLED HK date DRIFTS: post-race ELO backfill
+          // inflates the horses that ran well, silently promoting the actual
+          // placegetters into the "prediction" (2026-07-04 R1: the frozen
+          // 2-3-9-8 became a result-peeking 1-2-9-3). So for a settled date we
+          // OVERLAY the frozen pre-race prediction_log (the exact bettable
+          // snapshot /hit-rate reads) onto the freshly-recomputed rich shape:
+          // scores/order/scoreSource come from the frozen log, while
+          // names/jockey/trainer/factorBreakdown come from the recompute. pTop4 +
+          // box coverage are rebuilt from the frozen pWin (log→softmax is the
+          // identity, so Harville place probs stay exactly consistent). We do NOT
+          // use race_day_report_cache — it is DELETEd per-date on refresh,
+          // whereas prediction_log is durable. Incomplete/missing frozen log →
+          // keep the recompute (honest fallback, matching /hit-rate).
+          if (await dateHasSettledResults(db, date, meeting.venue)) {
+            const synthEntries = (result.races ?? []).map((r: any) => ({ race_number: r.raceNumber, distance: r.distance, going: r.going }));
+            const frozen = await loadFrozenPicksForHitRate(db, date, engine, synthEntries).catch(() => null);
+            if (frozen && Array.isArray(frozen.races) && frozen.races.length) {
+              const frozenByNum = new Map<number, any>(frozen.races.map((fr: any) => [fr.raceNumber, fr]));
+              for (const r of (result.races ?? [])) {
+                const fr = frozenByNum.get(r.raceNumber);
+                if (!fr || !Array.isArray(fr.picks) || !fr.picks.length) continue;
+                const rcByNum = new Map<any, any>((r.picks ?? []).map((p: any) => [p.horseNumber, p]));
+                const newPicks = fr.picks.map((fp: any) => {
+                  const rc = rcByNum.get(fp.horseNumber) ?? {};
+                  return {
+                    ...rc,
+                    horseId: fp.horseId ?? rc.horseId ?? null,
+                    horseNumber: fp.horseNumber,
+                    draw: fp.draw ?? rc.draw ?? null,
+                    nameCh: rc.nameCh ?? fp.nameCh,
+                    horseElo: fp.horseElo,
+                    eloComposite: fp.eloComposite,
+                    factorBonus: fp.factorBonus,
+                    finalScore: fp.finalScore,
+                    pWin: fp.pWin,
+                    pTop3: fp.pTop3,
+                    rank: fp.rank,
+                    lgbScore: fp.lgbScore,
+                    lgbModelVersion: fp.lgbModelVersion,
+                    scoreSource: fp.scoreSource,
+                  };
+                });
+                // Rebuild pTop4 + box coverage from the FROZEN pWin so the box
+                // panel matches the frozen ranking. log(pWin) → softmax identity
+                // → Harville place probs stay exactly consistent with pWin.
+                const scores = newPicks.map((p: any) => Math.log(Math.max(Number(p.pWin) || 0, 1e-9)));
+                const prob = computeRaceProbabilities(scores);
+                // Rebuild pTop3 too (not just pTop4): legacy prediction_log rows
+                // predating pl-prob stored a CRUDE pTop3 = min(pWin*3,0.99) that
+                // can exceed the Harville pTop4 → rebuilding both from the frozen
+                // pWin keeps pWin ≤ pTop3 ≤ pTop4 internally consistent.
+                newPicks.forEach((p: any, i: number) => { p.pTop3 = Math.round((prob.pTop3[i] ?? 0) * 1000) / 1000; p.pTop4 = Math.round((prob.pTop4[i] ?? 0) * 1000) / 1000; });
+                r.picks = newPicks;
+                r.expectedBoxCoverage = roundCoverage(prob.coverage);
+                r.probabilityModel = prob.model;
+                r.scoreSource = fr.scoreSource ?? r.scoreSource;
+                r.lgbCoverage = fr.lgbCoverage ?? r.lgbCoverage;
+                r.lgbModelVersion = fr.lgbModelVersion ?? r.lgbModelVersion;
+              }
+              attachRaceQuality(result.races);
+              return c.json({ ...result, source: 'historical', frozen: true });
+            }
+          }
+          return c.json({ ...result, source });
+        } catch {
+          return c.json({ error: 'picks-by-date failed' }, 500);
+        }
+      });
+
+      // GET /api/analyze/freeze-ledger?dates=2026-09-06,2026-09-09&since=2026-09-01
+      // 凍結對帳表：只讀已鎖 prediction_log。禁回測、禁 live 重算、唔改模型。
+      analyzeRoutes.get('/freeze-ledger', async (c) => {
+        try {
+          const datesRaw = c.req.query('dates');
+          const dates = datesRaw
+            ? datesRaw.split(',').map((s) => s.trim()).filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s))
+            : undefined;
+          const since = c.req.query('since') ?? undefined;
+          const payload = await computeFreezeLedger(c.env.DB, { dates, since });
+          return c.json(payload, 200, {
+            'Cache-Control': 'public, max-age=120, s-maxage=300',
+          });
+        } catch (e: any) {
+          return c.json({ error: 'freeze-ledger failed', detail: e?.message ?? String(e) }, 500);
+        }
+      });
+
+      // computeHitRateStats hoisted to module scope (see below) so cron handler can import it
+
+
+      // GET /api/analyze/hit-rate?date=YYYY-MM-DD — 過去賽事日預測 vs 實際結果比對
+        // Reads from meeting_hit_rate_cache (populated by daily cron). Pass ?refresh=1 to force recompute.
+        analyzeRoutes.get('/hit-rate', async (c) => {
+          try {
+            const date = c.req.query('date');
+            if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: '請提供 YYYY-MM-DD 格式日期' }, 400);
+            const admin = await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER);
+            const engine: EloEngine = admin && c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+            const refresh = admin && c.req.query('refresh') === '1';
+            // P3-C: ?alpha=0.62 lets offline tuner sweep candidates without
+            // mutating production α. When provided, bypass cache (read+write)
+            // so each α gets a fresh per-race blend.
+            const alphaRaw = admin ? c.req.query('alpha') : undefined;
+            const alphaOverride = alphaRaw != null && alphaRaw !== ''
+              ? Number(alphaRaw) : undefined;
+            const hasAlpha = typeof alphaOverride === 'number'
+              && Number.isFinite(alphaOverride) && alphaOverride >= 0 && alphaOverride <= 1;
+
+            if (!refresh) {
+              if (hasAlpha) {
+                const cachedA = await readHitRateAlphaCache(c.env.DB, date, engine, alphaOverride as number);
+                if (cachedA) {
+                  const payload = {
+                    date,
+                    venue: cachedA.meeting?.venue,
+                    trackCondition: cachedA.meeting?.track_condition,
+                    engine,
+                    alphaUsed: alphaOverride,
+                    summary: cachedA.summary,
+                    races: cachedA.races,
+                    generatedAt: cachedA.cachedAt,
+                    fromCache: true,
+                  };
+                  return c.json(admin ? payload : projectHitRateForPublic(payload));
+                }
+              } else {
+                const cached = await readHitRateCache(c.env.DB, date, engine);
+                if (cached && !hitRateCacheNeedsBoxRecompute(cached) && !hitRateCacheNeedsSourceRecompute(cached) && !(await hitRateCacheBehindResults(c.env.DB, date, cached))) {
+                  const payload = {
+                    date,
+                    venue: cached.meeting?.venue,
+                    trackCondition: cached.meeting?.track_condition,
+                    engine,
+                    summary: cached.summary,
+                    races: cached.races,
+                    generatedAt: cached.cachedAt,
+                    fromCache: true,
+                  };
+                  return c.json(admin ? payload : projectHitRateForPublic(payload));
+                }
+              }
+            }
+
+            await ensureHitRateCacheTable(c.env.DB).catch(() => {});
+            if (hasAlpha) await ensureHitRateAlphaCacheTable(c.env.DB).catch(() => {});
+            const result = await computeHitRateStats(c.env.DB, date, engine, hasAlpha ? alphaOverride : undefined, { boxPayouts: !hasAlpha });
+            if ('error' in result) return c.json({ error: result.error }, result.status as any);
+            if (hasAlpha) {
+              await writeHitRateAlphaCache(c.env.DB, date, engine, alphaOverride as number, result).catch(() => {});
+            } else {
+              await writeHitRateCache(c.env.DB, date, engine, result).catch(() => {});
+            }
+            const payload = {
+              date,
+              venue: result.meeting.venue,
+              trackCondition: result.meeting.track_condition,
+              engine,
+              alphaUsed: hasAlpha ? alphaOverride : undefined,
+              summary: result.summary,
+              races: result.races,
+              generatedAt: new Date().toISOString(),
+              fromCache: false,
+            };
+            return c.json(admin ? payload : projectHitRateForPublic(payload));
+          } catch {
+            return c.json({ error: 'hit-rate failed' }, 500);
+          }
+        });
+
+        // POST /api/analyze/ensemble-alpha {alpha}
+        // P3-C: admin-gated endpoint for offline α tuner to apply a chosen α
+        // after running the sweep outside CF Worker wall-time. Separates write
+        // from the heavy compute path.
+        analyzeRoutes.post('/ensemble-alpha', async (c) => {
+          try {
+            if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.BEARER_ONLY))) return c.json({ error: 'unauthorized' }, 401);
+
+            const body = await c.req.json().catch(() => ({} as any));
+            const alpha = Number((body as any)?.alpha);
+            if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
+              return c.json({ error: 'alpha must be a number in [0,1]' }, 400);
+            }
+            await c.env.DB.prepare(
+              `INSERT INTO app_settings (key, value, updated_at) VALUES ('ensemble_alpha', ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+            ).bind(String(alpha)).run();
+            const currentAlpha = await getEnsembleAlpha(c.env.DB);
+            return c.json({ applied: true, alpha, currentAlpha, appliedAt: new Date().toISOString() });
+          } catch {
+            return c.json({ error: 'ensemble-alpha failed' }, 500);
+          }
+        });
+
+        // GET /api/analyze/d1-inspect?table=horse_elo_snapshots&horseId=horse_K152&limit=5
+        // P4-debug: admin-gated read-only D1 sample for diagnosing query
+        // mismatches (e.g. /top-picks returning null while leaderboard works).
+        // Whitelisted tables only; no arbitrary SQL.
+        analyzeRoutes.get('/d1-inspect', async (c) => {
+          try {
+            if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.BEARER_ONLY))) return c.json({ error: 'unauthorized' }, 401);
+
+            const ALLOWED: Record<string, { entityCol?: string; dateCol?: string }> = {
+              horse_elo_snapshots:   { entityCol: 'horse_id',   dateCol: 'as_of_date' },
+              jockey_elo_snapshots:  { entityCol: 'jockey_id',  dateCol: 'as_of_date' },
+              trainer_elo_snapshots: { entityCol: 'trainer_id', dateCol: 'as_of_date' },
+              race_meetings:         { dateCol: 'date' },
+              races:                 {},
+              app_settings:          {},
+              lgb_predictions:       { dateCol: 'race_date' },
+            };
+            const table = c.req.query('table') || '';
+            const spec = ALLOWED[table];
+            if (!spec) {
+              return c.json({ error: 'table not whitelisted', allowed: Object.keys(ALLOWED) }, 400);
+            }
+            const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '5', 10) || 5, 1), 50);
+
+            const wheres: string[] = [];
+            const binds: any[] = [];
+            const entityId = c.req.query('entityId') || c.req.query('horseId') || c.req.query('jockeyId') || c.req.query('trainerId');
+            if (entityId && spec.entityCol) {
+              wheres.push(`${spec.entityCol} = ?`); binds.push(entityId);
+            }
+            const since = c.req.query('since');
+            if (since && spec.dateCol) { wheres.push(`${spec.dateCol} >= ?`); binds.push(since); }
+            const until = c.req.query('until');
+            if (until && spec.dateCol) { wheres.push(`${spec.dateCol} <= ?`); binds.push(until); }
+            const idLike = c.req.query('idLike');
+            if (idLike) { wheres.push(`id LIKE ?`); binds.push(idLike); }
+            const axisKey = c.req.query('axisKey');
+            if (axisKey) { wheres.push(`axis_key = ?`); binds.push(axisKey); }
+
+            const whereSql = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+            const orderSql = spec.dateCol ? `ORDER BY ${spec.dateCol} DESC` : '';
+
+            const { results: schema } = await c.env.DB.prepare(
+              `SELECT name, type, [notnull] AS not_null, dflt_value FROM pragma_table_info(?)`
+            ).bind(table).all<any>();
+
+            const { results: rows } = await c.env.DB.prepare(
+              `SELECT * FROM ${table} ${whereSql} ${orderSql} LIMIT ?`
+            ).bind(...binds, limit).all<any>();
+
+            const facts: any = { rowCount: rows?.length ?? 0 };
+            if (spec.dateCol) {
+              const { results: dr } = await c.env.DB.prepare(
+                `SELECT MIN(${spec.dateCol}) AS minDate, MAX(${spec.dateCol}) AS maxDate, COUNT(*) AS total FROM ${table} ${whereSql}`
+              ).bind(...binds).all<any>();
+              facts.dateRange = dr?.[0] ?? null;
+            }
+            const colNames = new Set((schema ?? []).map((r: any) => r.name));
+            if (colNames.has('axis_key')) {
+              const { results: ak } = await c.env.DB.prepare(
+                `SELECT axis_key, COUNT(*) AS n FROM ${table} ${whereSql} GROUP BY axis_key ORDER BY n DESC LIMIT 10`
+              ).bind(...binds).all<any>();
+              facts.axisKeyDistribution = ak;
+            }
+            if (colNames.has('id')) {
+              const { results: ip } = await c.env.DB.prepare(
+                `SELECT SUBSTR(id, 1, 8) AS idPrefix, COUNT(*) AS n FROM ${table} ${whereSql} GROUP BY idPrefix ORDER BY n DESC LIMIT 10`
+              ).bind(...binds).all<any>();
+              facts.idPrefixDistribution = ip;
+            }
+
+            return c.json({ table, filters: { entityId, since, until, idLike, axisKey, limit }, schema, facts, rows });
+          } catch {
+            return c.json({ error: 'd1-inspect failed' }, 500);
+          }
+        });
+
+        // GET /api/analyze/prediction-accuracy?days=90 — Brier／log-loss／可靠度校準
+        analyzeRoutes.get('/prediction-accuracy', async (c) => {
+          try {
+            const daysParam = c.req.query('days');
+            const days = Math.max(7, Math.min(730, parseInt(daysParam || '90', 10) || 90));
+            const payload = await summarizePredictionAccuracy(c.env.DB, days);
+            return c.json(payload);
+          } catch (e) {
+            console.warn('prediction-accuracy failed', e);
+            return c.json({ error: 'prediction-accuracy failed' }, 500);
+          }
+        });
+
+        // GET /api/analyze/residuals?days=365 — 殘差診斷：按班次／路程／場地／賠率／馬場找系統性偏差
+        analyzeRoutes.get('/residuals', async (c) => {
+          try {
+            const days = Math.max(30, Math.min(1095, parseInt(c.req.query('days') || '365', 10) || 365));
+            return c.json(await summarizeResiduals(c.env.DB, days));
+          } catch (e) {
+            console.warn('residuals failed', e);
+            return c.json({ error: 'residuals failed' }, 500);
+          }
+        });
+
+
+
+        // GET /api/analyze/calibration — 讀取現行機率校準
+        // GET /api/analyze/calibration?days=365&fit=1[&apply=1] — 重新擬合（管理員）
+        // Time-split: 舊 70% 擬合、最新 30% 驗證；只有 holdout 分數改善才建議套用。
+        analyzeRoutes.get('/calibration', async (c) => {
+          try {
+            const db = c.env.DB;
+            const current = await getProbCalibration(db);
+            const fit = c.req.query('fit') === '1';
+            const apply = c.req.query('apply') === '1';
+            if (!fit && !apply) return c.json({ current, applied: !!current?.top3 });
+            if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+
+            const days = Math.max(30, Math.min(730, parseInt(c.req.query('days') || '365', 10) || 365));
+            await ensurePredictionLogTable(db);
+            const sinceDate = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+            const { results } = await db.prepare(
+              `SELECT date, p_win, p_top3, actual_win_odds, is_hit_top1, is_hit_top3
+                 FROM prediction_log
+                WHERE date >= ? AND actual_finish IS NOT NULL
+                  AND (variant IS NULL OR variant = 'baseline')
+                ORDER BY date ASC`
+            ).bind(sinceDate).all<any>().catch(() => ({ results: [] as any[] }));
+            const rows = (results ?? []).filter((r: any) => r.p_top3 != null && r.is_hit_top3 != null);
+            if (rows.length < 200) {
+              return c.json({ error: 'insufficient samples', samples: rows.length, current }, 200);
+            }
+            // Undo the currently stored mapping so we always fit on raw model
+            // probabilities (prediction_log stores what was served).
+            const t3prev = current?.top3 ?? null;
+            const rawTop3 = (p: number): number => {
+              if (!t3prev) return p;
+              const q = Math.min(1 - 1e-4, Math.max(1e-4, p));
+              const z = Math.log(q / (1 - q));
+              const raw = (z - t3prev.b) / (t3prev.a || 1);
+              return 1 / (1 + Math.exp(-raw));
+            };
+            const all: Sample[] = rows.map((r: any) => ({ p: rawTop3(Number(r.p_top3)), y: r.is_hit_top3 ? 1 : 0 }));
+
+            const cut = Math.floor(all.length * 0.7);
+            const trainRows = all.slice(0, cut);
+            const holdRows = all.slice(cut);
+            const trainFit = fitPlatt(trainRows);
+            const fullFit = fitPlatt(all);
+            if (!trainFit || !fullFit) return c.json({ error: 'fit failed', samples: all.length, current }, 200);
+            const before = scoreSamples(holdRows);
+            const after = scoreSamples(holdRows.map((s) => ({ p: applyPlatt(s.p, trainFit), y: s.y })));
+            // Gate: proper scores (Brier + log-loss) must improve on the
+            // holdout, and binned ECE must not get materially worse (the bin
+            // counts are small on a 30% holdout, so ECE is the noisy metric).
+            // ── Stage 5: segmented (per odds band) calibration ─────────────
+            // Fit one Platt curve per market band with the same time split and
+            // holdout gate. Only bands that improve BOTH Brier and log-loss on
+            // their own holdout are kept. Ranking is untouched.
+            const wantBands = c.req.query('bands') === '1';
+            const bandRows: Record<string, Sample[]> = {};
+            if (wantBands) {
+              for (const r of rows as any[]) {
+                const bk = bandForOdds(r.actual_win_odds);
+                if (!bk) continue;
+                (bandRows[bk] ||= []).push({ p: rawTop3(Number(r.p_top3)), y: r.is_hit_top3 ? 1 : 0 });
+              }
+            }
+            const bandReport: any[] = [];
+            const bandParams: Record<string, PlattParams | null> = {};
+            if (wantBands) {
+              for (const band of ODDS_BANDS) {
+                const set = bandRows[band.key] ?? [];
+                if (set.length < 200) {
+                  bandReport.push({ band: band.key, label: band.label, samples: set.length, kept: false, reason: 'insufficient samples' });
+                  continue;
+                }
+                const bCut = Math.floor(set.length * 0.7);
+                const bTrain = fitPlatt(set.slice(0, bCut));
+                const bFull = fitPlatt(set);
+                if (!bTrain || !bFull) {
+                  bandReport.push({ band: band.key, label: band.label, samples: set.length, kept: false, reason: 'fit failed' });
+                  continue;
+                }
+                const bHold = set.slice(bCut);
+                const bBefore = scoreSamples(bHold);
+                const bAfter = scoreSamples(bHold.map((x) => ({ p: applyPlatt(x.p, bTrain), y: x.y })));
+                // A band curve must beat the GLOBAL curve on its own holdout —
+                // beating raw probabilities is not enough, the global curve is
+                // already live. Reject degenerate slopes (near-flat or blown
+                // up) which just print a constant probability.
+                const bGlobal = scoreSamples(bHold.map((x) => ({ p: applyPlatt(x.p, trainFit), y: x.y })));
+                const sane = bTrain.a >= 0.1 && bTrain.a <= 3 && bFull.a >= 0.1 && bFull.a <= 3 &&
+                  Math.abs(bTrain.b) <= 5 && Math.abs(bFull.b) <= 5;
+                const bOk = sane &&
+                  bGlobal.brier != null && bAfter.brier != null &&
+                  bGlobal.logLoss != null && bAfter.logLoss != null &&
+                  bAfter.brier <= bGlobal.brier - 1e-6 &&
+                  bAfter.logLoss <= bGlobal.logLoss - 1e-6;
+                if (bOk) bandParams[band.key] = bFull;
+                bandReport.push({
+                  band: band.key, label: band.label, samples: set.length,
+                  trainFit: bTrain, fullFit: bFull,
+                  holdoutBefore: bBefore, holdoutGlobal: bGlobal, holdoutAfter: bAfter, sane, kept: bOk,
+                });
+              }
+            }
+            const bandsKept = Object.keys(bandParams).length;
+
+            const improved =
+              before.brier != null && after.brier != null &&
+              before.logLoss != null && after.logLoss != null &&
+              before.ece != null && after.ece != null &&
+              after.brier <= before.brier + 1e-6 &&
+              after.logLoss <= before.logLoss + 1e-6 &&
+              after.ece <= before.ece * 1.1;
+
+            let stored: StoredCalibration | null = current;
+            if (apply && (improved || bandsKept > 0)) {
+              stored = {
+                version: (current?.version ?? 0) + 1,
+                top3: improved ? (fullFit as PlattParams) : (current?.top3 ?? null),
+                bands: bandsKept > 0 ? bandParams : (current?.bands ?? null),
+                win: null,
+                fittedAt: new Date().toISOString(),
+                days,
+                samples: all.length,
+                holdout: { before, after },
+                ...(bandsKept > 0 ? { bandHoldout: bandReport } as any : {}),
+              };
+              await db.prepare(
+                `INSERT INTO app_settings (key, value, updated_at) VALUES ('prob_calibration', ?, datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+              ).bind(JSON.stringify(stored)).run();
+            }
+            return c.json({
+              days, samples: all.length,
+              train: trainRows.length, holdout: holdRows.length,
+              trainFit, fullFit,
+              holdoutBefore: before, holdoutAfter: after,
+              improved,
+              bands: wantBands ? bandReport : undefined,
+              bandsKept,
+              applied: apply && (improved || bandsKept > 0),
+              current: stored,
+            });
+          } catch (e) {
+            console.warn('calibration failed', e);
+            return c.json({ error: 'calibration failed' }, 500);
+          }
+        });
+
+
+        // GET /api/analyze/hit-rate-rollup?days=30 — 滾動窗口整體命中率彙總
+      analyzeRoutes.get('/hit-rate-rollup', async (c) => {
+        try {
+          const db = c.env.DB;
+          const daysParam = c.req.query('days');
+          const days = Math.max(1, Math.min(180, parseInt(daysParam || '30', 10) || 30));
+          const admin = await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER);
+          const engine: EloEngine = admin && c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const today = new Date().toISOString().substring(0, 10);
+          const cutoff = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+          // Rollup-level cache: aggregating per-meeting cache over N meetings is
+          // sequential D1 reads (~9s for 90d). Cache the whole payload keyed by
+          // window + engine, validated by `to`=today. Safe because the rollup
+          // window is [cutoff, today) — today's results never count until the
+          // calendar day rolls over, so a per-day key is exact. ?refresh=1 bypasses.
+          const refresh = admin && c.req.query('refresh') === '1';
+          const rollupKey = `__rollup_${days}`;
+          // Version-derived key (NOT hardcoded 'tx3') so a HIT_RATE_CACHE_VERSION
+          // bump invalidates rollup rows in lockstep with per-meeting rows.
+          const rollupEng = `${_engineKey(engine)}-rollup`;
+          if (!refresh) {
+            try {
+              const row = await db.prepare(`SELECT payload_json FROM meeting_hit_rate_cache WHERE date=? AND engine=?`).bind(rollupKey, rollupEng).first<{ payload_json: string }>();
+              if (row?.payload_json) {
+                const parsed = JSON.parse(row.payload_json);
+                if (parsed && parsed.to === today && (parsed.meetingsEvaluated ?? 0) > 0) {
+                  return c.json(admin ? { ...parsed, cached: true } : projectHitRateRollupForPublic(parsed));
+                }
+              }
+            } catch (e) { console.warn('hit-rate-rollup cache read failed', e); /* fall through to recompute */ }
+          }
+          let datesFailed = false;
+          const datesQ = await db.prepare(
+            "SELECT DISTINCT rm.date AS date, rm.venue AS venue " +
+            "FROM race_meetings rm JOIN races r ON r.meeting_id = rm.id JOIN race_results rr ON rr.race_id = r.id " +
+            "WHERE rm.date >= ? AND rm.date < ? AND rm.venue IN ('ST','HV') AND rr.finishing_position IS NOT NULL " +
+            "ORDER BY rm.date DESC"
+          ).bind(cutoff, today).all<any>().catch((e: any) => { datesFailed = true; console.warn('hit-rate-rollup dates query failed', e); return { results: [] as any[] }; });
+          const meetingDates: any[] = (datesQ.results as any[]) || [];
+                  let totalRaces = 0, totalTop1Hits = 0, totalTop3AnyHits = 0, totalTop3Intersect = 0;
+            let totalQuinella = 0, totalQp = 0, totalTrio = 0, totalTierce = 0;
+            let totalFirst4 = 0, totalFirst4Eligible = 0, totalQuartet = 0;
+            let totalTop4Intersect = 0, totalTop4Eligible = 0;
+            const perMeeting: any[] = [];
+            const errors: any[] = [];
+            for (const m of meetingDates) {
+              try {
+                // Cache-first: avoid Worker timeout when iterating many meetings.
+                // Falls back to live compute (and back-fills cache) when row missing
+                // or has stale Stage-4a shape (no quinellaHits field).
+                let r: any = await readHitRateCache(db, m.date, engine);
+                if (!r?.summary || r.summary.quinellaHits === undefined || r.summary.top4SumIntersect === undefined || r.summary.quartetHits === undefined) {
+                  const computed = await computeHitRateStats(db, m.date, engine);
+                  if ('error' in computed) { errors.push({date: m.date, error: computed.error}); continue; }
+                  await writeHitRateCache(db, m.date, engine, computed).catch(() => {});
+                  r = computed;
+                }
+                const s = r.summary;
+                if (!s.racesEvaluated) continue;
+                perMeeting.push({ date: m.date, venue: m.venue, ...s });
+                totalRaces += s.racesEvaluated;
+                totalTop1Hits += s.top1Hits;
+                totalTop3AnyHits += s.top3AnyHits;
+                totalTop3Intersect += s.top3SumIntersect;
+                totalQuinella += s.quinellaHits ?? 0;
+                totalQp += s.qpHits ?? 0;
+                totalTrio += s.trioHits ?? 0;
+                totalTierce += s.tierceHits ?? 0;
+                totalFirst4 += s.first4Hits ?? 0;
+                totalFirst4Eligible += s.first4Eligible ?? 0;
+                totalQuartet += s.quartetHits ?? 0;
+                totalTop4Intersect += s.top4SumIntersect ?? 0;
+                totalTop4Eligible += s.top4Eligible ?? 0;
+              } catch (e: any) { errors.push({date: m.date, error: e?.message || String(e)}); }
+            }
+            const rRate = (n: number, d: number) => d ? Math.round(n / d * 1000) / 10 : null;
+            const payload: any = {
+              windowDays: days, from: cutoff, to: today,
+              meetingsFound: meetingDates.length,
+              meetingsEvaluated: perMeeting.length,
+              racesEvaluated: totalRaces,
+              top1HitRate: rRate(totalTop1Hits, totalRaces),
+              top3AnyHitRate: rRate(totalTop3AnyHits, totalRaces),
+              top3AvgIntersect: totalRaces ? Math.round(totalTop3Intersect/totalRaces*100)/100 : null,
+              quinellaHitRate: rRate(totalQuinella, totalRaces),
+              qpHitRate: rRate(totalQp, totalRaces),
+              trioHitRate: rRate(totalTrio, totalRaces),
+              tierceHitRate: rRate(totalTierce, totalRaces),
+              first4HitRate: rRate(totalFirst4, totalFirst4Eligible),
+              quartetHitRate: rRate(totalQuartet, totalFirst4Eligible),
+              top4AvgIntersect: totalTop4Eligible ? Math.round(totalTop4Intersect / totalTop4Eligible * 100) / 100 : null,
+              top4Eligible: totalTop4Eligible,
+              top1Hits: totalTop1Hits, top3AnyHits: totalTop3AnyHits,
+              quinellaHits: totalQuinella, qpHits: totalQp,
+              trioHits: totalTrio, tierceHits: totalTierce,
+              first4Hits: totalFirst4, first4Eligible: totalFirst4Eligible,
+              quartetHits: totalQuartet,
+              perMeeting, errors,
+              generatedAt: new Date().toISOString(),
+            };
+            // 唔好將失敗／空結果寫入全日快取：之前一次 D1 短暫失敗會令成日顯示 0 場。
+            if (!datesFailed && perMeeting.length > 0 && errors.length === 0) try {
+              await db.prepare(`INSERT OR REPLACE INTO meeting_hit_rate_cache (date, engine, payload_json, computed_at) VALUES (?, ?, ?, ?)`)
+                .bind(rollupKey, rollupEng, JSON.stringify(payload), new Date().toISOString()).run();
+            } catch (e) { console.warn('hit-rate-rollup cache write failed', e); /* best-effort */ }
+            return c.json(admin ? payload : projectHitRateRollupForPublic(payload));
+        } catch {
+          return c.json({ error: 'hit-rate-rollup failed' }, 500);
+        }
+      });
+
+      // GET /api/analyze/strategy-pnl?engine=v12 — 天喜策略累計盈虧
+      // 由引擎開始記錄(最早有箱形派彩快取嘅賽日)至今，每場以 $10/注 複式箱形投注模型首4，
+      // 同時落齊四個箱形彩池：四連環(FF,任序首4,1注)、單T(TRIO,任序首3,4注)、
+      // 三重彩(TIERCE,依序首3,24注)、四重彩(QUARTET,依序首4,24注) = $530/場。
+      // 由 $0 起始本金，逐個賽日彙總 cost / payout / net + 累計，並附每池細分。
+      // ⚠ 設計上係 −EV(每場每池全落)，累計線預期向下；此為透明紀錄，唔會「修正」蝕數。
+      // 速度：聚合結果快取於 __strategy_pnl_<from>，stale-while-revalidate —— 命中即時回應，
+      // 過期(跨 UTC 日或 >6h)先喺背景 waitUntil 重算；冷檔只填補近 21 日未有箱形派彩嘅賽日，
+      // 古早無派彩賽日當 skippedMissingBoxData 跳過，唔再每次 load 都白做 HKJC 抓取。
+      analyzeRoutes.get('/strategy-pnl', async (c) => {
+        try {
+          const db = c.env.DB;
+          const admin = await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER);
+          const engine: EloEngine = admin && c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const today = new Date().toISOString().substring(0, 10);
+          const refresh = admin && c.req.query('refresh') === '1';
+          const engKey = _engineKey(engine);
+          // engine-start anchor (mirror computeStrategyPnl) so the cache key matches.
+          let from = admin ? (c.req.query('from') || '') : '';
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+            // Mirror computeStrategyPnl: anchor to the first HK race day of June
+            // 2026 onward (pre-June history excluded) so the cache key matches.
+            const STRATEGY_PNL_ANCHOR = '2026-06-01';
+            const fb = await db.prepare(
+              "SELECT MIN(m.date) AS d FROM race_meetings m WHERE m.venue IN ('ST','HV') AND m.date >= ?" +
+              " AND EXISTS (SELECT 1 FROM races r JOIN race_results rr ON rr.race_id=r.id WHERE r.meeting_id=m.id AND rr.finishing_position>0)",
+            ).bind(STRATEGY_PNL_ANCHOR).first<{ d: string | null }>().catch(() => null);
+            from = fb?.d || STRATEGY_PNL_ANCHOR;
+          }
+          const pnlKey = `__strategy_pnl_${from}`;
+          const pnlEng = `${engKey}-pnl`;
+
+          // Stale-while-revalidate: serve any cached aggregate IMMEDIATELY, and
+          // only when stale (different UTC day or >6h old) kick a single
+          // non-blocking background recompute. No longer gated on pending===0,
+          // so the page is instant even while a recent race day is still settling.
+          if (!refresh) {
+            try {
+              const row = await db.prepare(
+                "SELECT payload_json, computed_at FROM meeting_hit_rate_cache WHERE date=? AND engine=?",
+              ).bind(pnlKey, pnlEng).first<{ payload_json: string; computed_at: string }>();
+              if (row?.payload_json) {
+                const parsed = JSON.parse(row.payload_json);
+                const genMs = parsed.generatedAt ? Date.parse(parsed.generatedAt) : (row.computed_at ? Date.parse(row.computed_at) : NaN);
+                const ageMs = Number.isFinite(genMs) ? (Date.now() - genMs) : Infinity;
+                const stale = parsed.to !== today || ageMs > 6 * 3600 * 1000;
+                if (stale) {
+                  try {
+                    c.executionCtx.waitUntil(
+                      computeStrategyPnl(db, engine, { from, fillBudget: 2, deadlineMs: 15000 }).then(() => {}).catch(() => {}),
+                    );
+                  } catch (e) { /* no execution context -> skip bg refresh */ }
+                }
+                return c.json(
+                  admin
+                    ? { ...parsed, cached: true, stale }
+                    : projectStrategyPnlForPublic(parsed),
+                );
+              }
+            } catch (e) { console.warn('strategy-pnl cache read failed', e); /* fall through to compute */ }
+          }
+
+          // Cold path (no cache yet, or ?refresh=1): compute with a small
+          // foreground fill budget (recent days only); the helper writes the cache.
+          const payload = await computeStrategyPnl(db, engine, { from, fillBudget: 1, deadlineMs: 15000 });
+          return c.json(admin ? payload : projectStrategyPnlForPublic(payload));
+        } catch {
+          return c.json({ error: 'strategy-pnl failed' }, 500);
+        }
+      });
+
+      // GET /api/analyze/ensemble-tune?days=30&apply=0
+      // P4: TX-Oracle v3 α grid search. Runs computeHitRateStats for α ∈
+      // {0.40, 0.50, 0.62, 0.75, 0.85} over last N days of meetings with
+      // results, aggregates top-1 / top-4 intersect, picks winner.
+      // ?apply=1 writes winner α into app_settings (key='ensemble_alpha').
+      analyzeRoutes.get('/ensemble-tune', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const db = c.env.DB;
+          const days = Math.max(7, Math.min(180, parseInt(c.req.query('days') || '30', 10) || 30));
+          const apply = c.req.query('apply') === '1';
+          const engine: EloEngine = c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const today = new Date().toISOString().substring(0, 10);
+          const cutoff = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+          const datesQ = await db.prepare(
+            "SELECT DISTINCT rm.date AS date FROM race_meetings rm " +
+            "JOIN races r ON r.meeting_id = rm.id JOIN race_results rr ON rr.race_id = r.id " +
+            "WHERE rm.date >= ? AND rm.date < ? AND rm.venue IN ('ST','HV') AND rr.finishing_position IS NOT NULL " +
+            "ORDER BY rm.date DESC"
+          ).bind(cutoff, today).all<any>().catch(() => ({ results: [] as any[] }));
+          const dates: string[] = ((datesQ.results as any[]) || []).map((m: any) => m.date as string);
+          const alphas = [0.40, 0.50, 0.62, 0.75, 0.85];
+          const perAlpha: Record<string, any> = {};
+          for (const a of alphas) {
+            let races = 0, top1 = 0, top4Int = 0, top4Elig = 0;
+            for (const d of dates) {
+              try {
+                const r = await computeHitRateStats(db, d, engine, a);
+                if ('error' in r) continue;
+                const s = r.summary;
+                if (!s.racesEvaluated) continue;
+                races += s.racesEvaluated;
+                top1 += s.top1Hits || 0;
+                top4Int += s.top4SumIntersect || 0;
+                top4Elig += s.top4Eligible || 0;
+              } catch { /* skip */ }
+            }
+            perAlpha[a.toFixed(2)] = {
+              alpha: a,
+              races,
+              top1Hits: top1,
+              top1HitRate: races ? Math.round(top1 / races * 1000) / 10 : null,
+              top4SumIntersect: top4Int,
+              top4Eligible: top4Elig,
+              top4AvgIntersect: top4Elig ? Math.round(top4Int / top4Elig * 100) / 100 : null,
+            };
+          }
+          // Pick winner: rank by (top1 hit rate * 0.6 + top4 avg intersect * 0.4)
+          let winner: { alpha: number; score: number } | null = null;
+          for (const k of Object.keys(perAlpha)) {
+            const r = perAlpha[k];
+            const t1 = (r.top1HitRate || 0) / 100;
+            const t4 = (r.top4AvgIntersect || 0) / 4;
+            const score = t1 * 0.6 + t4 * 0.4;
+            r.compositeScore = Math.round(score * 1000) / 1000;
+            if (!winner || score > winner.score) winner = { alpha: r.alpha, score };
+          }
+          let applied = false;
+          let applyDenied = false;
+          if (apply && winner) {
+            // Reading/tuning supports browser sessions, but mutating production
+            // configuration is Bearer-only so a cross-site GET cannot apply it.
+            const ok = await hasAdminAccess(c, ADMIN_AUTH_POLICY.BEARER_ONLY);
+            if (!ok) {
+              applyDenied = true;
+            } else {
+              await db.prepare(
+                `INSERT INTO app_settings (key, value, updated_at) VALUES ('ensemble_alpha', ?, datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+              ).bind(String(winner.alpha)).run().catch(() => {});
+              applied = true;
+            }
+          }
+          const currentAlpha = await getEnsembleAlpha(db);
+          return c.json({
+            windowDays: days, from: cutoff, to: today,
+            meetingsEvaluated: dates.length,
+            alphas, perAlpha,
+            winner: winner ? { alpha: winner.alpha, compositeScore: Math.round(winner.score * 1000) / 1000 } : null,
+            currentAlpha,
+            applied,
+            applyDenied,
+            generatedAt: new Date().toISOString(),
+          });
+        } catch {
+          return c.json({ error: 'ensemble-tune failed' }, 500);
+        }
+      });
+
+      // GET /api/analyze/elo-tune?days=90&apply=0
+      // ELO 三軸權重 grid search（馬／騎師／練馬師）。α 固定用現行生產值，
+      // 逐個權重組合重算過去 N 日賽事，主指標＝四揀平均命中匹數。
+      // ?apply=1 將最佳組合寫入 app_settings(key='elo_weights')。
+      // GET /api/analyze/draw-tune?from=&to=&days=&apply=1
+      // 檔位效應 A/B：v1（現行：場地+路程，固定 0.25 基準）vs v2（加賽道分層 + 場數期望 + 收縮）。
+      analyzeRoutes.get('/draw-tune', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const db = c.env.DB;
+          const days = Math.max(7, Math.min(365, parseInt(c.req.query('days') || '90', 10) || 90));
+          const apply = c.req.query('apply') === '1';
+          const engine: EloEngine = c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const alpha = await getEnsembleAlpha(db);
+          const eloW = await getEloWeights(db);
+          const today = new Date().toISOString().substring(0, 10);
+          const cutoff = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+          const dre = /^\d{4}-\d{2}-\d{2}$/;
+          const qFrom = (c.req.query('from') || '').substring(0, 10);
+          const qTo = (c.req.query('to') || '').substring(0, 10);
+          const rangeFrom = dre.test(qFrom) ? qFrom : cutoff;
+          const rangeTo = dre.test(qTo) ? qTo : today;
+          const datesQ = await db.prepare(
+            "SELECT DISTINCT rm.date AS date FROM race_meetings rm " +
+            "JOIN races r ON r.meeting_id = rm.id JOIN race_results rr ON rr.race_id = r.id " +
+            "WHERE rm.date >= ? AND rm.date < ? AND rm.venue IN ('ST','HV') AND rr.finishing_position IS NOT NULL " +
+            "ORDER BY rm.date DESC"
+          ).bind(rangeFrom, rangeTo).all<any>().catch(() => ({ results: [] as any[] }));
+          const dates: string[] = ((datesQ.results as any[]) || []).map((m: any) => m.date as string);
+          const wanted = (c.req.query('variants') || 'v1,v2,v3').split(',').map((x) => x.trim()).filter((x) => x === 'v1' || x === 'v2' || x === 'v3') as DrawModel[];
+          const variants: DrawModel[] = wanted.length ? [...new Set(wanted)] : ['v1', 'v2', 'v3'];
+          const scales: number[] = [...new Set((c.req.query('scales') || '1').split(',')
+            .map((x) => parseFloat(x.trim())).filter((x) => Number.isFinite(x) && x > 0 && x <= 200))];
+          if (!scales.length) scales.push(1);
+          const perVariant: Record<string, any> = {};
+          for (const dm of variants) for (const sc of scales) {
+            const key = sc === 1 ? dm : dm + 'x' + sc;
+            let races = 0, top1 = 0, top3Int = 0, top4Int = 0, top4Elig = 0, trio = 0, first4 = 0;
+            for (const d of dates) {
+              try {
+                const r = await computeHitRateStats(db, d, engine, alpha, { eloWeightsOverride: eloW, drawModelOverride: dm, drawScaleOverride: sc });
+                if ('error' in r) continue;
+                const sm: any = r.summary;
+                if (!sm.racesEvaluated) continue;
+                races += sm.racesEvaluated;
+                top1 += sm.top1Hits || 0;
+                top3Int += sm.top3SumIntersect || 0;
+                top4Int += sm.top4SumIntersect || 0;
+                top4Elig += sm.top4Eligible || 0;
+                trio += sm.trioHits || 0;
+                first4 += sm.first4Hits || 0;
+              } catch { /* skip */ }
+            }
+            perVariant[key] = {
+              drawModel: dm, drawScale: sc, races,
+              top4SumIntersect: top4Int, top4Eligible: top4Elig, top3SumIntersect: top3Int, top1Hits: top1,
+              top4AvgIntersect: top4Elig ? Math.round(top4Int / top4Elig * 1000) / 1000 : null,
+              top3AvgIntersect: races ? Math.round(top3Int / races * 1000) / 1000 : null,
+              top1HitRate: races ? Math.round(top1 / races * 1000) / 10 : null,
+              trioHits: trio, first4Hits: first4,
+            };
+          }
+          let winner: string | null = null; let best = -1;
+          for (const k of Object.keys(perVariant)) {
+            const r = perVariant[k];
+            const score = (r.top4AvgIntersect ?? 0) * 1000 + (r.top3AvgIntersect ?? 0) * 10 + (r.top1HitRate ?? 0) / 1000;
+            if (score > best) { best = score; winner = k; }
+          }
+          let applied = false, applyDenied = false;
+          if (apply && winner) {
+            const ok = await hasAdminAccess(c, ADMIN_AUTH_POLICY.BEARER_ONLY);
+            if (!ok) applyDenied = true;
+            else {
+              await db.prepare(
+                `INSERT INTO app_settings (key, value, updated_at) VALUES ('draw_model', ?, datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+              ).bind(winner).run().catch(() => {});
+              applied = true;
+            }
+          }
+          return c.json({
+            from: rangeFrom, to: rangeTo, meetingsEvaluated: dates.length,
+            ensembleAlpha: alpha, eloWeights: eloW,
+            variants, scales, perVariant, winner,
+            currentDrawModel: await getDrawModel(db), applied, applyDenied,
+            generatedAt: new Date().toISOString(),
+          });
+        } catch {
+          return c.json({ error: 'draw-tune failed' }, 500);
+        }
+      });
+
+      analyzeRoutes.get('/elo-tune', async (c) => {
+        try {
+          if (!(await hasAdminAccess(c, ADMIN_AUTH_POLICY.SESSION_OR_BEARER))) return privateRouteUnavailable(c);
+          const db = c.env.DB;
+          const days = Math.max(7, Math.min(365, parseInt(c.req.query('days') || '90', 10) || 90));
+          const apply = c.req.query('apply') === '1';
+          const engine: EloEngine = c.req.query('engine') === 'v11' ? 'v11' : 'v12';
+          const alpha = await getEnsembleAlpha(db);
+          const today = new Date().toISOString().substring(0, 10);
+          const cutoff = new Date(Date.now() - days * 86400000).toISOString().substring(0, 10);
+          const dre = /^\d{4}-\d{2}-\d{2}$/;
+          const qFrom = (c.req.query('from') || '').substring(0, 10);
+          const qTo = (c.req.query('to') || '').substring(0, 10);
+          const rangeFrom = dre.test(qFrom) ? qFrom : cutoff;
+          const rangeTo = dre.test(qTo) ? qTo : today;
+          const datesQ = await db.prepare(
+            "SELECT DISTINCT rm.date AS date FROM race_meetings rm " +
+            "JOIN races r ON r.meeting_id = rm.id JOIN race_results rr ON rr.race_id = r.id " +
+            "WHERE rm.date >= ? AND rm.date < ? AND rm.venue IN ('ST','HV') AND rr.finishing_position IS NOT NULL " +
+            "ORDER BY rm.date DESC"
+          ).bind(rangeFrom, rangeTo).all<any>().catch(() => ({ results: [] as any[] }));
+          const dates: string[] = ((datesQ.results as any[]) || []).map((m: any) => m.date as string);
+
+          // 可選 ?grid=0.7-0.2-0.1,0.6-0.3-0.1 自訂；預設掃描馬 0.50–0.85。
+          const parseGrid = (raw: string | undefined): EloWeights[] => {
+            if (!raw) return [];
+            const out: EloWeights[] = [];
+            for (const part of raw.split(',')) {
+              const [h, j, t] = part.split('-').map((v) => Number(v));
+              const w = normalizeEloWeights({ horse: h, jockey: j, trainer: t });
+              if (w) out.push(w);
+            }
+            return out;
+          };
+          const custom = parseGrid(c.req.query('grid') || undefined);
+          const combos: EloWeights[] = custom.length ? custom : [
+            { horse: 0.50, jockey: 0.35, trainer: 0.15 },
+            { horse: 0.55, jockey: 0.30, trainer: 0.15 },
+            { horse: 0.60, jockey: 0.25, trainer: 0.15 },
+            { horse: 0.60, jockey: 0.30, trainer: 0.10 },
+            { horse: 0.65, jockey: 0.25, trainer: 0.10 },
+            { horse: 0.70, jockey: 0.20, trainer: 0.10 },
+            { horse: 0.70, jockey: 0.25, trainer: 0.05 },
+            { horse: 0.75, jockey: 0.15, trainer: 0.10 },
+            { horse: 0.80, jockey: 0.15, trainer: 0.05 },
+            { horse: 0.85, jockey: 0.10, trainer: 0.05 },
+          ];
+
+          const key = (w: EloWeights) => `${w.horse.toFixed(2)}-${w.jockey.toFixed(2)}-${w.trainer.toFixed(2)}`;
+          const perCombo: Record<string, any> = {};
+          for (const w of combos) {
+            let races = 0, top1 = 0, top3Int = 0, top4Int = 0, top4Elig = 0, trio = 0, first4 = 0;
+            for (const d of dates) {
+              try {
+                const r = await computeHitRateStats(db, d, engine, alpha, { eloWeightsOverride: w });
+                if ('error' in r) continue;
+                const sm: any = r.summary;
+                if (!sm.racesEvaluated) continue;
+                races += sm.racesEvaluated;
+                top1 += sm.top1Hits || 0;
+                top3Int += sm.top3SumIntersect || 0;
+                top4Int += sm.top4SumIntersect || 0;
+                top4Elig += sm.top4Eligible || 0;
+                trio += sm.trioHits || 0;
+                first4 += sm.first4Hits || 0;
+              } catch { /* skip */ }
+            }
+            perCombo[key(w)] = {
+              weights: { horse: Math.round(w.horse * 100) / 100, jockey: Math.round(w.jockey * 100) / 100, trainer: Math.round(w.trainer * 100) / 100 },
+              races,
+              top4SumIntersect: top4Int,
+              top4Eligible: top4Elig,
+              top3SumIntersect: top3Int,
+              top1Hits: top1,
+              top4AvgIntersect: top4Elig ? Math.round(top4Int / top4Elig * 1000) / 1000 : null,
+              top3AvgIntersect: races ? Math.round(top3Int / races * 1000) / 1000 : null,
+              top1HitRate: races ? Math.round(top1 / races * 1000) / 10 : null,
+              trioHits: trio,
+              first4Hits: first4,
+            };
+          }
+          // 主指標＝四揀平均命中匹數；同分先睇前三平均，再睇 Top1。
+          let winner: { key: string; weights: EloWeights } | null = null;
+          let best = -1;
+          for (const k of Object.keys(perCombo)) {
+            const r = perCombo[k];
+            const score = (r.top4AvgIntersect ?? 0) * 1000 + (r.top3AvgIntersect ?? 0) * 10 + (r.top1HitRate ?? 0) / 1000;
+            if (score > best) { best = score; winner = { key: k, weights: r.weights }; }
+          }
+          let applied = false, applyDenied = false;
+          if (apply && winner) {
+            const ok = await hasAdminAccess(c, ADMIN_AUTH_POLICY.BEARER_ONLY);
+            if (!ok) applyDenied = true;
+            else {
+              await db.prepare(
+                `INSERT INTO app_settings (key, value, updated_at) VALUES ('elo_weights', ?, datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+              ).bind(JSON.stringify(winner.weights)).run().catch(() => {});
+              applied = true;
+            }
+          }
+          const currentWeights = await getEloWeights(db);
+          return c.json({
+            windowDays: days, from: rangeFrom, to: rangeTo,
+            meetingsEvaluated: dates.length,
+            ensembleAlpha: alpha,
+            combos: combos.map(key), perCombo,
+            winner, currentWeights, applied, applyDenied,
+            generatedAt: new Date().toISOString(),
+          });
+        } catch {
+          return c.json({ error: 'elo-tune failed' }, 500);
+        }
+      });
+  
+
+
