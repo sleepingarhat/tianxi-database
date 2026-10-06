@@ -17,9 +17,6 @@ permissions:
 jobs:
   season_gate:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
     timeout-minutes: 5
     outputs:
       skip: ${{ steps.chk.outputs.skip }}
