@@ -1381,6 +1381,11 @@ export async function computeHitRateStats(db: D1Database, date: string, engine: 
         ensembleAlpha: (race as any).ensembleAlpha ?? null,
         lgbModelVersion: (race as any).lgbModelVersion ?? null,
         lgbCoverage: (race as any).lgbCoverage ?? null,
+        // 第 5 選：凍結 prediction_log 本身存全場排序，直接攞 rank 5（孖T／三T 二拖三用）
+        predictedFifth: (race.picks ?? [])[4] ? {
+          rank: 5, horseNumber: (race.picks as any[])[4].horseNumber, horseId: (race.picks as any[])[4].horseId,
+          frozen: picksFromFrozenLog,
+        } : null,
         // New: top-4 picks (rank 1-4) with per-pick reason text + hit flag
         predictedTop4: predictedTop4.map((p: any) => ({
           rank: p.rank, horseNumber: p.horseNumber, horseId: p.horseId,
