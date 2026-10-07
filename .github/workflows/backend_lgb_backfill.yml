@@ -31,31 +31,26 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: backend
+        working-directory: tianxi-backend
     timeout-minutes: 90
 
     steps:
       - name: Checkout backend
         uses: actions/checkout@v4
         with:
-          path: tianxi-backend
+          path: repo
+      - name: Link tianxi-backend → 統一倉 backend/
+        working-directory: ${{ github.workspace }}
+        run: ln -sfn "$GITHUB_WORKSPACE/repo/backend" "$GITHUB_WORKSPACE/tianxi-backend"
 
-      - name: Checkout data (public repo, sparse)
-        uses: actions/checkout@v4
-        with:
-          repository: sleepingarhat/tianxi-database
-          path: hkjc-data
-          sparse-checkout: |
-            data
-            horses/form_records
-            last_sync.json
-          sparse-checkout-cone-mode: false
+      - name: Link hkjc-data → 統一倉根
+        working-directory: ${{ github.workspace }}
+        run: ln -sfn "$GITHUB_WORKSPACE/repo" "$GITHUB_WORKSPACE/hkjc-data"
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
           cache-dependency-path: tianxi-backend/package-lock.json
 
       - uses: actions/setup-python@v5
