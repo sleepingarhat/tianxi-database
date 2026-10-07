@@ -282,6 +282,10 @@ function projectHitRateRace(value: unknown): JsonRecord | null {
   projected.predictedTop4 = Array.isArray(value.predictedTop4)
     ? value.predictedTop4.map((item) => projectResultHorse(item)).filter(Boolean)
     : [];
+  const f5 = isRecord(value.predictedFifth) ? value.predictedFifth : null;
+  projected.predictedFifth = f5 && f5.horseNumber != null
+    ? { rank: 5, horseNumber: f5.horseNumber, frozen: f5.frozen === true }
+    : null;
   projected.actualTop4 = Array.isArray(value.actualTop4)
     ? value.actualTop4.map((item) => projectResultHorse(item, true)).filter(Boolean)
     : [];
