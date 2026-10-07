@@ -64,13 +64,14 @@ jobs:
     needs: season_gate
     if: needs.season_gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
     timeout-minutes: 10
     steps:
       - name: Checkout tianxi-backend (scraper + push scripts)
         uses: actions/checkout@v4
         with:
-          repository: sleepingarhat/tianxi-backend
-          token: ${{ secrets.TIANXI_BACKEND_PAT || secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
       - uses: actions/setup-node@v4
