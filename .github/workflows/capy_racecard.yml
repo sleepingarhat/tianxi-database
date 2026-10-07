@@ -51,13 +51,14 @@ jobs:
       github.event_name == 'schedule' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
     timeout-minutes: 10
     steps:
       - name: Checkout tianxi-backend (scrape-racecard.ts + push scripts)
         uses: actions/checkout@v4
         with:
-          repository: sleepingarhat/tianxi-backend
-          token: ${{ secrets.TIANXI_BACKEND_PAT || secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
       - uses: actions/setup-node@v4
@@ -171,13 +172,13 @@ jobs:
       - name: Trigger LGB predict on tianxi-backend
         if: steps.scrape.outputs.has_data == 'true' && github.event.inputs.dry_run != 'true'
         env:
-          GH_PAT: ${{ secrets.TIANXI_BACKEND_PAT }}
+          GH_PAT: ${{ secrets.TIANXI_BACKEND_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           if curl -fsSL -X POST \
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/sleepingarhat/tianxi-backend/actions/workflows/lgb_predict_upcoming.yml/dispatches" \
+            "https://api.github.com/repos/sleepingarhat/tianxi-racing/actions/workflows/backend_lgb_predict_upcoming.yml/dispatches" \
             -d '{"ref":"main","inputs":{"days_ahead":"7"}}'; then
             echo "Dispatched lgb_predict_upcoming on tianxi-backend (entries enriched -> predict)"
           else
