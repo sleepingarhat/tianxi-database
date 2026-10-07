@@ -17,9 +17,6 @@ on:
 jobs:
   fill:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tianxi-backend
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
