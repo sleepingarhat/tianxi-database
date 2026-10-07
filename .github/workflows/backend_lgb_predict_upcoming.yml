@@ -67,7 +67,7 @@ jobs:
           path: repo
       - name: Link tianxi-backend → 統一倉 backend/
         working-directory: ${{ github.workspace }}
-        run: ln -sfn "$GITHUB_WORKSPACE/repo/backend" "$GITHUB_WORKSPACE/tianxi-backend"
+        run: mv "$GITHUB_WORKSPACE/repo/backend" "$GITHUB_WORKSPACE/tianxi-backend"
 
       - name: Link hkjc-data → 統一倉根
         working-directory: ${{ github.workspace }}
