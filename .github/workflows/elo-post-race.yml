@@ -74,13 +74,9 @@ jobs:
           path: tianxi-database
           fetch-depth: 1
 
-      - name: Checkout tianxi-backend (scripts + push-delta.ts)
-        uses: actions/checkout@v4
-        with:
-          repository: sleepingarhat/tianxi-backend
-          path: tianxi-backend
-          token: ${{ secrets.TIANXI_BACKEND_PAT || secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
+      - name: Link tianxi-backend → 統一倉 backend/
+        working-directory: ${{ github.workspace }}
+        run: ln -sfn "$GITHUB_WORKSPACE/tianxi-database/backend" "$GITHUB_WORKSPACE/tianxi-backend"
 
       - uses: actions/setup-node@v4
         with:
