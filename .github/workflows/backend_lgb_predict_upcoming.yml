@@ -55,9 +55,6 @@ jobs:
     needs: season_gate
     if: needs.season_gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tianxi-backend
     timeout-minutes: 240
 
     steps:
