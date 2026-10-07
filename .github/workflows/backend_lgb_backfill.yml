@@ -29,9 +29,6 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tianxi-backend
     timeout-minutes: 90
 
     steps:
