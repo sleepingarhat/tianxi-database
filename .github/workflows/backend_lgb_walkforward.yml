@@ -49,9 +49,6 @@ on:
 jobs:
   walkforward:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tianxi-backend
     timeout-minutes: 45
 
     steps:
